@@ -1,0 +1,6 @@
+Quick — what are the very first three words that pop into your mind when you think of the word "{{cue}}"?  
+Don’t overthink it.
+Use mostly single words.
+Use the following format:
+response1, response2, response3
+Return only the three words as comma-separated values, do not provide any explanations or context.

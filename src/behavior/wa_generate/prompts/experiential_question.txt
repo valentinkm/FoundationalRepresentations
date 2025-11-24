@@ -1,0 +1,6 @@
+What are the first three personal associations you have with the word "{{cue}}"?  
+Use mostly single words.
+Use the following format:
+response1, response2, response3
+Return only the three words as comma-separated values, do not provide any explanations or context.
+

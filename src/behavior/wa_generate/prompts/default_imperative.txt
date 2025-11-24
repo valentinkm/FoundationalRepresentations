@@ -1,0 +1,5 @@
+Think of the first three words that come to mind when you see the word "{{cue}}".  
+Use mostly single words.
+Use the following format:
+response1, response2, response3
+Return only the three words as comma-separated values, do not provide any explanations or context.
