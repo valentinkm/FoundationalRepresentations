@@ -1,5 +1,5 @@
 """
-src/behavior/vectorize.py
+src/vectorize.py
 
 The "Feature Factory" for Behavioral Representations.
 This script converts raw model outputs into standardized Semantic Matrices.
@@ -343,7 +343,11 @@ if __name__ == "__main__":
     # Default paths based on your provided tree
     try:
         script_dir = Path(__file__).parent.resolve()
-        project_root = script_dir.parent.parent
+        project_root = script_dir.parent
+        for candidate in (script_dir, *script_dir.parents):
+            if (candidate / 'data').exists():
+                project_root = candidate
+                break
         
         # Defaults
         default_swow = project_root / 'data' / 'SWOW' / 'Human_SWOW-EN.R100.20180827.csv'
