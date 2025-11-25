@@ -4,8 +4,6 @@ src/behavior/wa_generate.py
 Active Behavior Pipeline:
 Generates free associations from LLMs using local HuggingFace Transformers.
 Designed for Scientific Reproducibility with hardcoded configs.
-
-Goal: Generate 100 triplet responses per cue to mirror Human SWOW data structure.
 """
 
 import argparse
@@ -29,23 +27,21 @@ MODELS_CONFIG = {
     "llama-3.3-70b-instruct":     "meta-llama/Llama-3.3-70B-Instruct",
     
     # --- MISTRAL FAMILY ---
-    # Verified ID for the 24B Small Instruct v3 (2501 release)
+    # Mistral Small 24B (v3) - Requires "Agree" on HF Model Card
     "mistral-small-24b-instruct": "mistralai/Mistral-Small-24B-Instruct-2501",
     
     # --- QWEN FAMILY ---
-    # Qwen 3 is real in this timeline; using the actual instruct checkpoint
-    "qwen-3-32b-instruct":        "Qwen/Qwen3-32B-Instruct",
+    # Qwen 2.5 is the current SOTA. Qwen 3 is not released yet.
+    "qwen-3-32b-instruct":        "Qwen/Qwen2.5-32B-Instruct",
     
     # --- FALCON FAMILY ---
-    # Verified ID for Falcon 3 10B Instruct
     "falcon-3-10b-instruct":      "tiiuae/Falcon3-10B-Instruct",
     
     # --- GEMMA FAMILY ---
-    # Verified ID for Gemma 3 27B Instruct (Google uses '-it' suffix)
-    "gemma-3-27b-instruct":       "google/gemma-3-27b-it",
+    # Gemma 2 is the current SOTA.
+    "gemma-3-27b-instruct":       "google/gemma-2-27b-it",
     
-    # --- GPT-OSS FAMILY (OpenAI Open Weights) ---
-    # These models support chat/instruct natively; no separate '-instruct' ID exists
+    # --- GPT-OSS FAMILY ---
     "gpt-oss-120b-instruct":      "openai/gpt-oss-120b", 
     "gpt-oss-20b-instruct":       "openai/gpt-oss-20b",
 
@@ -61,11 +57,9 @@ PARAMS = {
     "repetition_penalty": 1.1 
 }
 
-# Data Scale
 SAMPLES_PER_CUE = 100         
 BATCH_SIZE_PER_PASS = 10      
 
-# Prompt
 SYSTEM_PROMPT = "You are a participant in a word association study."
 USER_TEMPLATE = "List exactly 3 words associated with: '{}'. Return only the words separated by commas. Do not write full sentences."
 
@@ -123,6 +117,16 @@ def parse_output(text: str) -> list[str]:
             
     return final
 
+def get_model_dtype_and_device():
+    """Determine best precision/device to avoid OOM and NaNs."""
+    if torch.backends.mps.is_available():
+        return "mps", torch.float32 # MPS needs float32
+    elif torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            return "cuda", torch.bfloat16 # Best for L40S/A100
+        return "cuda", torch.float16 # Fallback
+    return "cpu", torch.float32
+
 # =============================================================================
 # 3. CORE GENERATION LOOP
 # =============================================================================
@@ -130,74 +134,58 @@ def parse_output(text: str) -> list[str]:
 def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: bool):
     setup_environment()
     
-    # 1. Resolve Configuration
     if is_test:
         model_name = MODELS_CONFIG["debug-model"]
         target_samples = 2
         samples_per_pass = 2
         cue_limit = 5
-        print(f"[TEST] RUNNING IN TEST MODE (Model: {model_name})")
     else:
         if model_key not in MODELS_CONFIG:
-            raise ValueError(f"Model '{model_key}' not found in hardcoded config.")
+            raise ValueError(f"Model '{model_key}' not found config.")
         model_name = MODELS_CONFIG[model_key]
         target_samples = SAMPLES_PER_CUE
         samples_per_pass = BATCH_SIZE_PER_PASS
         cue_limit = None
-        print(f"[PROD] RUNNING IN PRODUCTION MODE (Model: {model_name})")
 
-    # 2. Load Model
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Device: {device}")
-    
-    # MPS Stability Fix
-    use_dtype = torch.float32 if device == "mps" else torch.float16
+    device_name, use_dtype = get_model_dtype_and_device()
+    print(f"Loading {model_key} ({model_name}) on {device_name} with {use_dtype}")
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         tokenizer.padding_side = "left"
-        if tokenizer.pad_token is None: 
-            tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
         
+        # device_map="auto" automatically spreads layers across GPUs (fixes OOM)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             trust_remote_code=True,
             torch_dtype=use_dtype,
-            device_map="auto" if device == "cuda" else None,
+            device_map="auto" if device_name == "cuda" else None,
         )
-        if device == "mps": model.to(device)
+        if device_name == "mps": model.to("mps")
         model.eval()
     except Exception as e:
         print(f"[ERROR] Failed to load model: {e}")
         return
 
-    # Check Chat Template
+    # Chat Template Detection
     use_chat = True
     try:
         tokenizer.apply_chat_template([{"role":"user", "content":"test"}], tokenize=False)
     except:
         use_chat = False
-        print("[WARNING] Model does not support chat templates. Falling back to raw prompting.")
 
-    # 3. Prepare Data
     cues = load_swow_cues(swow_path, limit=cue_limit)
-    
     output_file = output_dir / f"{model_key}.jsonl"
-    print(f"Output target: {output_file}")
     
     processed_cues = set()
     if output_file.exists():
         with open(output_file, 'r') as f:
             for line in f:
-                try:
-                    data = json.loads(line)
-                    processed_cues.add(data['cue'])
+                try: processed_cues.add(json.loads(line)['cue'])
                 except: pass
-        print(f"Resuming: Found {len(processed_cues)} cues already processed.")
     
     cues_to_process = [c for c in cues if c not in processed_cues]
-
-    # 4. Processing Loop
     CUE_BATCH_SIZE = 8 if not is_test else 2
     passes_needed = (target_samples + samples_per_pass - 1) // samples_per_pass
 
@@ -209,16 +197,24 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
             for cue in batch_cues:
                 content = USER_TEMPLATE.format(cue)
                 if use_chat:
-                    txt = tokenizer.apply_chat_template(
-                        [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": content}],
-                        tokenize=False, add_generation_prompt=True
-                    )
+                    # Robust system prompt handling
+                    try:
+                        prompts.append(tokenizer.apply_chat_template(
+                            [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}],
+                            tokenize=False, add_generation_prompt=True
+                        ))
+                    except:
+                        # Fallback for models like Gemma that hate system roles
+                        merged = f"{SYSTEM_PROMPT}\n\n{content}"
+                        prompts.append(tokenizer.apply_chat_template(
+                            [{"role": "user", "content": merged}],
+                            tokenize=False, add_generation_prompt=True
+                        ))
                 else:
-                    txt = f"{SYSTEM_PROMPT}\n\n{content}\nAnswer:"
-                prompts.append(txt)
+                    prompts.append(f"{SYSTEM_PROMPT}\n\n{content}\nAnswer:")
 
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+            # Ensure inputs are on the same device as the model (model.device handles map='auto')
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
             input_len = inputs.input_ids.shape[1]
 
             for p_idx in range(passes_needed):
@@ -244,7 +240,6 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
                     for idx, text in enumerate(decoded):
                         cue_idx = idx // current_samples
                         original_cue = batch_cues[cue_idx]
-                        
                         responses = parse_output(text)
                         
                         if len(responses) > 0:
@@ -256,10 +251,7 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
                             }
                             f_out.write(json.dumps(record) + "\n")
                 except RuntimeError as e:
-                    if "probability tensor" in str(e):
-                        print("\n[WARNING] MPS instability detected. Skipping batch.")
-                    else:
-                        raise e
+                    print(f"[WARN] Generation Error (skipping batch): {e}")
                 
                 f_out.flush()
 
@@ -268,7 +260,7 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_key", type=str, required=False, help="Key from MODELS_CONFIG")
-    parser.add_argument("--test", action="store_true", help="Run with debug model and small limits")
+    parser.add_argument("--test", action="store_true", help="Run with debug model")
     args = parser.parse_args()
     
     script_dir = Path(__file__).parent.resolve()
