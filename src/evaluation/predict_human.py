@@ -1,16 +1,11 @@
 """
-src/evaluation/predict.py
+src/evaluation/predict_human.py
 
-The "Judge" of the competition.
 Evaluates how well different semantic representations predict psycholinguistic norms.
 
 Method:
 - Ridge Regression (L2 Regularization) with Cross-Validation.
 - Metric: R^2 (Variance Explained).
-
-Modes:
-1. Human Prediction: Can embedding X predict Human Norm Y? (The primary benchmark)
-2. Self-Consistency: Can embedding X predict Model Norm Y? (Do representations match output behavior?)
 """
 
 import argparse

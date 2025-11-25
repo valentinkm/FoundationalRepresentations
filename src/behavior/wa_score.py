@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# score.py
+# wa_score.py
 """
 - Batched scoring script for word association.
 - Resume-from-checkpoint (skips swow_id already saved in CSV).
@@ -69,21 +69,21 @@ def configure_logging(log_file: Optional[str] = None,
 # - batch_size: override global BATCH_SIZE if present
 MODEL_CONFIGS = {
     "gemma27b": {
-        "model_key": "gemma-3-27b-it",
+        "model_key": "gemma-3-27b-instruct",
         "model_name": "google/gemma-3-27b-it",
         "is_test": False,
         "batch_size": 16,
         "needs_all_gpus": False,
     },
     "mistral24b": {
-        "model_key": "Mistral-Small-24B-Instruct-2501",
+        "model_key": "mistral-small-24b-instruct",
         "model_name": "mistralai/Mistral-Small-24B-Instruct-2501",
         "is_test": False,
         "batch_size": 16,
         "needs_all_gpus": False,
     },
     "qwen32b": {
-        "model_key": "Qwen3-32B",
+        "model_key": "qwen-3-32b-instruct",
         "model_name": "Qwen/Qwen3-32B",
         "is_test": False,
         "batch_size": 16,
@@ -91,42 +91,42 @@ MODEL_CONFIGS = {
     },
     # ---- Llama ----
     "llama31_8b_base": {
-        "model_key": "Llama-3.1-8B",
+        "model_key": "llama-3.1-8b-base",
         "model_name": "meta-llama/Llama-3.1-8B",
         "is_test": False,
         "batch_size": 64,
         "needs_all_gpus": False,
     },
     "llama31_8b_it": {
-        "model_key": "Llama-3.1-8B-Instruct",
+        "model_key": "llama-3.1-8b-instruct",
         "model_name": "meta-llama/Llama-3.1-8B-Instruct",
         "is_test": False,
         "batch_size": 64,
         "needs_all_gpus": False,
     },
     "llama31_70b_base": {
-        "model_key": "Llama-3.1-70B",
+        "model_key": "llama-3.1-70b-base",
         "model_name": "meta-llama/Llama-3.1-70B",
         "is_test": False,
         "batch_size": 2,
         "needs_all_gpus": True,
     },
     "llama33_70b_it": {
-        "model_key": "Llama-3.3-70B-Instruct",
+        "model_key": "llama-3.3-70b-instruct",
         "model_name": "meta-llama/Llama-3.3-70B-Instruct",
         "is_test": False,
         "batch_size": 2,
         "needs_all_gpus": True,
     },        
     "olmo2_7b_base": {
-        "model_key": "OLMo-2-7B",
+        "model_key": "olmo-2-7b-base",
         "model_name": "allenai/OLMo-2-1124-7B",
         "is_test": False,
         "batch_size": 64,
         "needs_all_gpus": False,
     },
     "olmo2_7b_it": {
-        "model_key": "OLMo-2-7B-Instruct",
+        "model_key": "olmo-2-7b-instruct",
         "model_name": "allenai/OLMo-2-1124-7B-Instruct",
         "is_test": False,
         "batch_size": 64,
@@ -134,14 +134,14 @@ MODEL_CONFIGS = {
     },
     # ---- gpt ----
     "gptoss_20b": {
-        "model_key": "gpt-oss-20b",
+        "model_key": "gpt-oss-20b-instruct",
         "model_name": "openai/gpt-oss-20b",
         "is_test": False,
         "batch_size": 32,
         "needs_all_gpus": True,
     },
     "gptoss_120b": {
-        "model_key": "gpt-oss-120b",
+        "model_key": "gpt-oss-120b-instruct",
         "model_name": "openai/gpt-oss-120b",
         "is_test": False,
         "batch_size": 2,
@@ -149,14 +149,14 @@ MODEL_CONFIGS = {
     },
     # --- falcon ---
     "falcon3_10b_base": {
-        "model_key": "Falcon-3-10B",
+        "model_key": "falcon-3-10b-base",
         "model_name": "tiiuae/Falcon3-10B-Base",
         "is_test": False,
         "batch_size": 64,
         "needs_all_gpus": False,
     },
     "falcon3_10b_it": {
-        "model_key": "Falcon-3-10B-Instruct",
+        "model_key": "falcon-3-10b-instruct",
         "model_name": "tiiuae/Falcon3-10B-Instruct",
         "is_test": False,
         "batch_size": 64,
@@ -235,14 +235,19 @@ def _spawn_model_subprocess(
 
 # --- Shard Output Helpers ---
 def _shard_output_paths(model_key: str, num_shards: int, args: argparse.Namespace) -> (List[str], str):
-    dataset_tag = "deranged" if getattr(args, "use_deranged", False) else "swow"
-    base_name = f"{MODEL_CONFIGS[model_key]['model_key']}_{dataset_tag}_results.csv"
-    shard_names = [
-        f"{MODEL_CONFIGS[model_key]['model_key']}_{dataset_tag}_results_shard{i}of{num_shards}.csv"
-        for i in range(num_shards)
-    ]
-    shard_paths = [os.path.join(OUTPUTS_DIR, n) for n in shard_names]
-    merged_path = os.path.join(OUTPUTS_DIR, base_name)
+    use_deranged = bool(getattr(args, "use_deranged", False))
+    base_dir = DERANGED_OUTPUT_DIR if use_deranged else SWOW_OUTPUT_DIR
+    base_name = f"{MODEL_CONFIGS[model_key]['model_key']}-deranged-results" if use_deranged \
+                else MODEL_CONFIGS[model_key]['model_key']
+    if num_shards > 1:
+        shard_names = [
+            f"{base_name}_shard{i}of{num_shards}.csv"
+            for i in range(num_shards)
+        ]
+    else:
+        shard_names = [f"{base_name}.csv"]
+    shard_paths = [os.path.join(base_dir, n) for n in shard_names]
+    merged_path = os.path.join(base_dir, f"{base_name}.csv")
     return shard_paths, merged_path
 
 
@@ -267,7 +272,9 @@ def _merge_shard_outputs(model_key: str, num_shards: int, args: argparse.Namespa
         if "swow_id" in merged.columns:
             merged = merged.drop_duplicates(subset=["swow_id"], keep="first")
             merged = merged.sort_values("swow_id")
-        os.makedirs(OUTPUTS_DIR, exist_ok=True)
+        dest_dir = os.path.dirname(merged_path)
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
         merged.to_csv(merged_path, index=False)
         logging.info("[orchestrator] Merged %d shard file(s) into %s", len(existing), merged_path)
     except Exception as e:
@@ -414,10 +421,12 @@ def orchestrate_run_all(args: argparse.Namespace, model_sequence: Sequence[str])
     logging.info("[orchestrator] All models completed.")
 
 # --- File Paths & Settings ---
-SWOW_FILE_PATH = "data/SWOW/SWOW-EN.R100.20180827.csv"
-DERANGED_DEFAULT_PATH = "data/SWOW-EN.R100.20180827.deranged.csv"
-OUTPUTS_DIR = "outputs"
-LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
+SWOW_FILE_PATH = "data/SWOW/Human_SWOW-EN.R100.20180827.csv"
+DERANGED_DEFAULT_PATH = "data/SWOW/Human_SWOW-EN.R100.20180827.deranged.csv"
+OUTPUTS_BASE_DIR = "outputs"
+SWOW_OUTPUT_DIR = os.path.join(OUTPUTS_BASE_DIR, "raw_behavior", "model_swow_logprobs")
+DERANGED_OUTPUT_DIR = os.path.join(OUTPUTS_BASE_DIR, "raw_behavior", "model_swow_logprobs_deranged")
+LOGS_DIR = os.path.join(OUTPUTS_BASE_DIR, "logs")
 BATCH_SIZE = 128
 TEST_MAX_ROWS = 20
 
@@ -522,7 +531,7 @@ def ensure_deranged_dataset(
         "Could not locate a deranged dataset CSV. Checked the following paths:\n"
         f"  - {searched}\n"
         "Supply an existing file via --deranged-path or place "
-        "SWOW-EN.R100.20180827.deranged.csv next to wa_scoring.py or in ./data/."
+        "Human_SWOW-EN.R100.20180827.deranged.csv next to wa_score.py or in ./data/SWOW/."
     )
 
 
@@ -982,17 +991,20 @@ def run_for_model(model_key: str, df_all: pd.DataFrame, args: argparse.Namespace
             model_key,
         )
 
-    os.makedirs(OUTPUTS_DIR, exist_ok=True)
-    dataset_tag = "deranged" if args.use_deranged else "swow"
+    use_deranged = bool(args.use_deranged)
+    output_dir = DERANGED_OUTPUT_DIR if use_deranged else SWOW_OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    dataset_tag = "deranged" if use_deranged else "swow"
+    base_output_name = f"{model_display_key}-deranged-results" if use_deranged else model_display_key
 
     # Shard-aware output path
     num_shards = max(1, int(getattr(args, "num_shards", 1)))
     shard_index = int(getattr(args, "shard_index", 0))
     if num_shards > 1:
-        output_filename = f"{model_display_key}_{dataset_tag}_results_shard{shard_index}of{num_shards}.csv"
+        output_filename = f"{base_output_name}_shard{shard_index}of{num_shards}.csv"
     else:
-        output_filename = f"{model_display_key}_{dataset_tag}_results.csv"
-    output_path = os.path.join(OUTPUTS_DIR, output_filename)
+        output_filename = f"{base_output_name}.csv"
+    output_path = os.path.join(output_dir, output_filename)
     logging.info(f"Saving results for model '{model_display_key}' (dataset={dataset_tag}) to {output_path}")
 
     try:

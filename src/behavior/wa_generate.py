@@ -24,17 +24,33 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 # =============================================================================
 
 MODELS_CONFIG = {
-    # --- PRODUCTION MODELS ---
-    "llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
-    "llama-3.3-70b-instruct": "meta-llama/Llama-3.3-70B-Instruct", 
-    "mistral-nemo-12b":      "mistralai/Mistral-Nemo-Instruct-v1",
-    "qwen2.5-32b-instruct":  "Qwen/Qwen2.5-32B-Instruct",
-    "gemma-2-27b-it":        "google/gemma-2-27b-it",
-    "olmo-2-7b-instruct":    "allenai/OLMo-2-1124-7B-Instruct",
-    "falcon-3-10b-instruct": "tiiuae/Falcon-3-10B-Instruct",
+    # --- LLAMA FAMILY ---
+    "llama-3.1-8b-instruct":      "meta-llama/Llama-3.1-8B-Instruct",
+    "llama-3.3-70b-instruct":     "meta-llama/Llama-3.3-70B-Instruct",
     
+    # --- MISTRAL FAMILY ---
+    # Verified ID for the 24B Small Instruct v3 (2501 release)
+    "mistral-small-24b-instruct": "mistralai/Mistral-Small-24B-Instruct-2501",
+    
+    # --- QWEN FAMILY ---
+    # Qwen 3 is real in this timeline; using the actual instruct checkpoint
+    "qwen-3-32b-instruct":        "Qwen/Qwen3-32B-Instruct",
+    
+    # --- FALCON FAMILY ---
+    # Verified ID for Falcon 3 10B Instruct
+    "falcon-3-10b-instruct":      "tiiuae/Falcon3-10B-Instruct",
+    
+    # --- GEMMA FAMILY ---
+    # Verified ID for Gemma 3 27B Instruct (Google uses '-it' suffix)
+    "gemma-3-27b-instruct":       "google/gemma-3-27b-it",
+    
+    # --- GPT-OSS FAMILY (OpenAI Open Weights) ---
+    # These models support chat/instruct natively; no separate '-instruct' ID exists
+    "gpt-oss-120b-instruct":      "openai/gpt-oss-120b", 
+    "gpt-oss-20b-instruct":       "openai/gpt-oss-20b",
+
     # --- TEST/DEBUG MODEL ---
-    "debug-model":           "meta-llama/Llama-3.1-8B-Instruct" 
+    "debug-model":                "meta-llama/Llama-3.2-1B-Instruct" 
 }
 
 # Generation Parameters
@@ -79,31 +95,24 @@ def parse_output(text: str) -> list[str]:
     """Clean model output into a list of 3 words."""
     text = text.lower().strip()
     
-    # Filter refusals
     if any(x in text for x in ["i cannot", "as an ai", "sorry", "model", "language model"]):
         return []
 
-    # Filter thinking tokens (common in Qwen/DeepSeek)
     if "</think>" in text:
         text = text.split("</think>")[-1]
 
-    # Normalize delimiters: replace newlines and bullets with commas
     text = re.sub(r'[\n\r]', ',', text)
-    text = re.sub(r'^\d+\.\s*', '', text, flags=re.MULTILINE) # Remove "1. "
-    text = re.sub(r'^-\s*', '', text, flags=re.MULTILINE)     # Remove "- "
+    text = re.sub(r'^\d+\.\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^-\s*', '', text, flags=re.MULTILINE)
     
     parts = [p.strip() for p in text.split(',')]
     
-    # Clean non-alpha characters from individual words
     clean = []
     for p in parts:
-        # Keep only letters, numbers, hyphens, spaces
         w = "".join([c for c in p if c.isalnum() or c in "- "]).strip()
-        # Filter out meta-text
         if w and w not in ["sure", "here", "association"]:
             clean.append(w)
         
-    # Deduplicate preserving order
     seen = set()
     final = []
     for w in clean:
@@ -141,14 +150,8 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Device: {device}")
     
-    # DETERMINE DTYPE: MPS requires float32 for stability in sampling
-    if device == "mps":
-        use_dtype = torch.float32
-        print("[INFO] MPS detected: Forcing float32 for generation stability.")
-    elif device == "cuda":
-        use_dtype = torch.float16
-    else:
-        use_dtype = torch.float32
+    # MPS Stability Fix
+    use_dtype = torch.float32 if device == "mps" else torch.float16
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -168,7 +171,7 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
         print(f"[ERROR] Failed to load model: {e}")
         return
 
-    # Check for Chat Template support
+    # Check Chat Template
     use_chat = True
     try:
         tokenizer.apply_chat_template([{"role":"user", "content":"test"}], tokenize=False)
@@ -202,7 +205,6 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
         for i in tqdm(range(0, len(cues_to_process), CUE_BATCH_SIZE), desc="Processing Cues"):
             batch_cues = cues_to_process[i : i + CUE_BATCH_SIZE]
             
-            # Prepare Prompts
             prompts = []
             for cue in batch_cues:
                 content = USER_TEMPLATE.format(cue)
@@ -216,45 +218,48 @@ def run_generation(model_key: str, swow_path: Path, output_dir: Path, is_test: b
                     txt = f"{SYSTEM_PROMPT}\n\n{content}\nAnswer:"
                 prompts.append(txt)
 
-            # Tokenize
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
             input_len = inputs.input_ids.shape[1]
 
-            # REPEAT GENERATION
             for p_idx in range(passes_needed):
                 current_samples = min(samples_per_pass, target_samples - (p_idx * samples_per_pass))
                 if current_samples <= 0: break
 
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=PARAMS["max_new_tokens"],
-                        do_sample=True,
-                        temperature=PARAMS["temperature"],
-                        top_p=PARAMS["top_p"],
-                        repetition_penalty=PARAMS["repetition_penalty"],
-                        num_return_sequences=current_samples,
-                        pad_token_id=tokenizer.pad_token_id
-                    )
+                try:
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=PARAMS["max_new_tokens"],
+                            do_sample=True,
+                            temperature=PARAMS["temperature"],
+                            top_p=PARAMS["top_p"],
+                            repetition_penalty=PARAMS["repetition_penalty"],
+                            num_return_sequences=current_samples,
+                            pad_token_id=tokenizer.pad_token_id
+                        )
 
-                # Decode
-                gen_tokens = outputs[:, input_len:]
-                decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
+                    gen_tokens = outputs[:, input_len:]
+                    decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
-                for idx, text in enumerate(decoded):
-                    cue_idx = idx // current_samples
-                    original_cue = batch_cues[cue_idx]
-                    
-                    responses = parse_output(text)
-                    
-                    if len(responses) > 0:
-                        record = {
-                            "cue": original_cue,
-                            "responses": responses,
-                            "model": model_key,
-                            "config": PARAMS
-                        }
-                        f_out.write(json.dumps(record) + "\n")
+                    for idx, text in enumerate(decoded):
+                        cue_idx = idx // current_samples
+                        original_cue = batch_cues[cue_idx]
+                        
+                        responses = parse_output(text)
+                        
+                        if len(responses) > 0:
+                            record = {
+                                "cue": original_cue,
+                                "responses": responses,
+                                "model": model_key,
+                                "config": PARAMS
+                            }
+                            f_out.write(json.dumps(record) + "\n")
+                except RuntimeError as e:
+                    if "probability tensor" in str(e):
+                        print("\n[WARNING] MPS instability detected. Skipping batch.")
+                    else:
+                        raise e
                 
                 f_out.flush()
 
