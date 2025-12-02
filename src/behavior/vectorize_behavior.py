@@ -4,6 +4,15 @@ src/behavior/vectorize_behavior.py
 The "Feature Factory" for Behavioral Representations.
 Constructs Semantic Matrices aligned with the "Contrastive" methodology.
 
+FEATURES:
+- Matches SVD dimensions to specific Model Hidden States.
+- Generates 'human_matrix' embedding (Baseline).
+- Auto-switches to Randomized SVD for high-dimensions (Speed Fix).
+- Dimension strategy options:
+  - activation (default): mirror dims from activation_embeddings.pkl
+  - mapping: use MODEL_TARGET_DIMS
+  - fixed: user-specified dim for all non-human matrices
+
 Inputs:
 1. Human SWOW Data (Ground Truth for Vocab/Rows)
 2. Passive Real: Log-probability CSVs
@@ -12,10 +21,9 @@ Inputs:
 
 Outputs:
 - 'behavioral_embeddings.pkl' containing:
-  - 'passive_{model}': Real SVD embedding
-  - 'passive_{model}_contrast': Real+Deranged SVD embedding (Contrastive)
-  - 'passive_{model}_shuffled': Deranged SVD embedding
-  - 'active_{model}': Generated SVD embedding
+  - 'human_matrix': Human Counts SVD (300d)
+  - 'passive_{model}': Real SVD embedding (Matched Dim)
+  - 'passive_{model}_contrast': Real+Deranged SVD embedding (Matched Dim)
 """
 
 import pandas as pd
@@ -27,11 +35,33 @@ import argparse
 from scipy.sparse import csr_matrix, hstack
 from sklearn.utils.extmath import randomized_svd
 from scipy.sparse.linalg import svds
+import warnings
 
-# --- CONSTANTS ---
+# --- CONFIGURATION ---
 ROW_NORM_EPS = 1e-12
-DEFAULT_N_COMPONENTS = 300
 MIN_FREQ_THRESHOLD = 5
+
+# Models to keep in limited mode (default)
+LIMITED_MODE_MODELS = {
+    # GPT-20B
+    "gpt-oss-20b-instruct",
+    "gpt-oss-20-b-instruct",
+    # Mistral
+    "mistral-small-24b-instruct",
+    "mistral-small-24-b-instruct",
+    # Gemma 27B
+    "gemma-3-27b-instruct",
+    "gemma-3-27-b-instruct",
+    # Qwen 32B
+    "qwen-3-32b-instruct",
+    "qwen-3-32-b-instruct",
+}
+
+# Map normalized model names to their Activation Hidden Sizes (used as fallback)
+MODEL_TARGET_DIMS = {}
+
+# Human data and unknown models default to standard semantic space size
+DEFAULT_FALLBACK_DIM = 300 
 
 # =============================================================================
 # DATA LOADING & PREPROCESSING
@@ -39,12 +69,12 @@ MIN_FREQ_THRESHOLD = 5
 
 def infer_default_paths():
     script_dir = Path(__file__).parent.resolve()
-    project_root = script_dir.parents[1] # Assuming src/behavior/script.py
-    
-    # Check if we are in the right structure
-    if not (project_root / 'data').exists():
-        # Fallback for different execution contexts
-        project_root = Path.cwd()
+    # Try to find project root by looking for 'data' folder up the tree
+    project_root = script_dir
+    for parent in script_dir.parents:
+        if (parent / 'data').exists():
+            project_root = parent
+            break
 
     default_swow = project_root / 'data' / 'SWOW' / 'Human_SWOW-EN.R100.20180827.csv'
     default_passive = project_root / 'outputs' / 'raw_behavior' / 'model_swow_logprobs'
@@ -66,6 +96,47 @@ def normalize_model_name(raw: str) -> str:
     while '--' in name:
         name = name.replace('--', '-')
     return name
+
+def should_process_model(model_name: str, allowed_models: set | None) -> bool:
+    """Return True if the model should be processed under the current mode."""
+    return allowed_models is None or model_name in allowed_models
+
+def load_activation_dims(activation_pkl: Path) -> dict:
+    """
+    Load activation embedding shapes so we can match target dimensions.
+    Returns {normalized_model_name: dim}.
+    """
+    if not activation_pkl.exists():
+        print(f"[Dims] Activation pickle not found at {activation_pkl}.")
+        return {}
+    try:
+        with open(activation_pkl, "rb") as f:
+            payload = pickle.load(f)
+        embeddings = payload.get("embeddings", {})
+    except Exception as e:
+        print(f"[Dims] Failed to read activation pickle: {e}")
+        return {}
+
+    dim_map = {}
+    for key, mat in embeddings.items():
+        if not key.startswith("activation_"):
+            continue
+        model_raw = key.replace("activation_", "")
+        model_norm = normalize_model_name(model_raw)
+        dim_map[model_norm] = mat.shape[1]
+    print(f"[Dims] Loaded activation dims for {len(dim_map)} models.")
+    return dim_map
+
+def extract_model_from_key(key: str) -> str:
+    """Strip prefixes/suffixes to recover the model name portion."""
+    model = key
+    for prefix in ("passive_", "active_", "activation_"):
+        if model.startswith(prefix):
+            model = model[len(prefix):]
+    for suffix in ("_contrast", "_shuffled"):
+        if model.endswith(suffix):
+            model = model[: -len(suffix)]
+    return normalize_model_name(model)
 
 def load_human_swow(human_csv_path: Path, min_freq: int) -> tuple[pd.DataFrame, dict, dict]:
     print(f"[Human] Loading SWOW from {human_csv_path}...")
@@ -129,13 +200,10 @@ def build_prob_matrix(df: pd.DataFrame, mappings: dict, num_cues: int, num_respo
     return csr_matrix((agg['prob'], (agg['row'], agg['col'])), 
                       shape=(num_cues, num_responses))
 
-def process_passive_behavior(real_dir: Path, deranged_dir: Path, mappings: dict, vocab_set: set) -> dict:
+def process_passive_behavior(real_dir: Path, deranged_dir: Path, mappings: dict, vocab_set: set,
+                             allowed_models: set | None = None) -> dict:
     """
     Ingest Passive Logprobs (Real) + Passive Logprobs (Deranged).
-    Constructs: 
-      1. Real Matrix
-      2. Shuffled Matrix
-      3. Contrast Matrix (hstack [Real | Shuffled])
     """
     if not real_dir.exists():
         print(f"[Passive] Directory not found: {real_dir}")
@@ -149,7 +217,7 @@ def process_passive_behavior(real_dir: Path, deranged_dir: Path, mappings: dict,
     real_files = sorted(list(real_dir.glob('*.csv')))
     print(f"[Passive] Found {len(real_files)} real logprob files.")
     
-    # 2. Index Deranged Files (Mapping normalized name -> path)
+    # 2. Index Deranged Files
     deranged_map = {}
     if deranged_dir.exists():
         for f in deranged_dir.glob('*.csv'):
@@ -160,24 +228,23 @@ def process_passive_behavior(real_dir: Path, deranged_dir: Path, mappings: dict,
         raw_name = fp.stem
         model_name = normalize_model_name(raw_name)
         
-        # Skip deranged files if they accidentally sit in the real folder
         if "deranged" in model_name: continue
+        if not should_process_model(model_name, allowed_models):
+            print(f"[Passive] Skipping {model_name} (limited mode).")
+            continue
 
         try:
             # --- A. Process REAL ---
             df = pd.read_csv(fp)
-            # Preprocess
             df['cue'] = df['cue'].astype(str).str.lower().str.strip()
             df['response_set'] = df['response_set'].astype(str).str.lower().str.split(',')
             df = df.explode('response_set')
             df['response_set'] = df['response_set'].astype(str).str.strip()
             
-            # Filter
             mask = (df['cue'].isin(mappings['cue_to_idx'])) & (df['response_set'].isin(vocab_set))
             df = df[mask].copy()
             
-            if df.empty:
-                continue
+            if df.empty: continue
 
             mat_real = build_prob_matrix(df, mappings, num_cues, num_responses)
             matrices[f"passive_{model_name}"] = mat_real
@@ -198,17 +265,15 @@ def process_passive_behavior(real_dir: Path, deranged_dir: Path, mappings: dict,
                 if not df_d.empty:
                     mat_deranged = build_prob_matrix(df_d, mappings, num_cues, num_responses)
                     
-                    # Store Shuffled
                     matrices[f"passive_{model_name}_shuffled"] = mat_deranged
                     
-                    # Store Contrastive (Horizontal Stack)
-                    # Shape becomes (N_cues, 2 * N_responses)
+                    # Contrastive (Real | Deranged) -> 2x width
                     mat_contrast = hstack([mat_real, mat_deranged], format='csr')
                     matrices[f"passive_{model_name}_contrast"] = mat_contrast
                     
                     print(f"[Passive] {model_name}: Real {mat_real.shape} | Contrast {mat_contrast.shape}")
                 else:
-                    print(f"[Passive] {model_name}: Deranged file found but empty after filter.")
+                    print(f"[Passive] {model_name}: Deranged file empty after filtering.")
             else:
                 print(f"[Passive] {model_name}: No corresponding deranged file found.")
                 
@@ -217,10 +282,10 @@ def process_passive_behavior(real_dir: Path, deranged_dir: Path, mappings: dict,
             
     return matrices
 
-def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set) -> dict:
+def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set,
+                              allowed_models: set | None = None) -> dict:
     """Ingest Active Generated JSONLs."""
-    if not input_dir.exists():
-        return {}
+    if not input_dir.exists(): return {}
 
     matrices = {}
     cue_to_idx = mappings['cue_to_idx']
@@ -235,6 +300,10 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set) -
         raw_model_name = fp.stem
         model_name = normalize_model_name(raw_model_name)
         data_rows = []
+        
+        if not should_process_model(model_name, allowed_models):
+            print(f"[Active] Skipping {model_name} (limited mode).")
+            continue
         
         try:
             with open(fp, 'r') as f:
@@ -289,73 +358,103 @@ def calculate_ppmi(matrix: csr_matrix, smooth: float = 1e-10) -> csr_matrix:
     
     return csr_matrix((ppmi_values, (rows, cols)), shape=matrix.shape)
 
-def derive_dense_embeddings(matrices: dict, n_components: int = 300) -> dict:
+def get_target_dim(key: str, dim_lookup: dict, strategy: str, fallback_dim: int) -> int:
+    """Return target embedding dimension for a given matrix key."""
+    if key == 'human_matrix':
+        return 300
+
+    model_name = extract_model_from_key(key)
+
+    if strategy == "activation" and model_name in dim_lookup:
+        return dim_lookup[model_name]
+
+    if model_name in MODEL_TARGET_DIMS:
+        return MODEL_TARGET_DIMS[model_name]
+
+    if strategy == "fixed":
+        return fallback_dim
+
+    print(f"    WARNING: No dimension match found for '{key}'. Using fallback {fallback_dim}.")
+    return fallback_dim
+
+def derive_dense_embeddings(matrices: dict, dim_lookup: dict, strategy: str, fallback_dim: int) -> dict:
     dense_embeddings = {}
     
     for key, mat in matrices.items():
         if key == 'mappings': continue
         
-        print(f"  - Transforming {key}...")
+        target_dim = get_target_dim(key, dim_lookup, strategy, fallback_dim)
+        print(f"  - Transforming {key} -> Target Dim: {target_dim}")
+        
         ppmi = calculate_ppmi(mat.astype(np.float64))
         
-        min_dim = min(ppmi.shape)
-        k = min(n_components, min_dim - 1)
+        min_matrix_dim = min(ppmi.shape)
+        k = min(target_dim, min_matrix_dim - 1)
         
         if k < 2:
-            embeddings = np.zeros((ppmi.shape[0], n_components))
+            print(f"    WARNING: Matrix too small for SVD (dim={min_matrix_dim}). Returning Zeros.")
+            embeddings = np.zeros((ppmi.shape[0], target_dim))
         else:
-            try:
-                U, Sigma, VT = svds(ppmi, k=k)
-                idx = np.argsort(Sigma)[::-1]
-                U, Sigma = U[:, idx], Sigma[idx]
-                embeddings = U * np.sqrt(Sigma)
-            except:
+            if k < target_dim:
+                print(f"    NOTE: Matrix rank limit ({min_matrix_dim}) < Target ({target_dim}). Using k={k}.")
+            
+            # --- SMART SOLVER SELECTION ---
+            # If k > 500, avoid 'svds' (ARPACK) as it hangs on large k/n ratios.
+            # Use Randomized SVD for speed.
+            if k > 500:
+                print(f"    [Speed] Large k ({k}) detected. Using Randomized SVD directly.")
                 U, Sigma, VT = randomized_svd(ppmi, n_components=k, random_state=42)
                 embeddings = U * np.sqrt(Sigma)
-                
+            else:
+                try:
+                    U, Sigma, VT = svds(ppmi, k=k)
+                    idx = np.argsort(Sigma)[::-1]
+                    U, Sigma = U[:, idx], Sigma[idx]
+                    embeddings = U * np.sqrt(Sigma)
+                except Exception as e:
+                    print(f"    SVD Failed ({e}). Falling back to randomized SVD.")
+                    U, Sigma, VT = randomized_svd(ppmi, n_components=k, random_state=42)
+                    embeddings = U * np.sqrt(Sigma)
+            
+            # Pad with zeros if we couldn't reach the target dimension
+            if k < target_dim:
+                padding = np.zeros((embeddings.shape[0], target_dim - k))
+                embeddings = np.hstack([embeddings, padding])
+
         dense_embeddings[key] = np.nan_to_num(embeddings, nan=0.0)
         
     return dense_embeddings
 
 def align_and_sanitize_rows(final_embeddings: dict, mappings: dict, eps: float = 1e-12):
-    """
-    Ensure all embeddings share the same valid rows.
-    Drops rows that are zero-vectors in ANY of the embeddings.
-    """
     keys = list(final_embeddings.keys())
     if not keys: return final_embeddings, mappings
     
     print("\n[Sanitize] Aligning rows across all embeddings...")
-    
-    # 1. Create a joint validity mask
     n_rows = final_embeddings[keys[0]].shape[0]
     keep_mask = np.ones(n_rows, dtype=bool)
     
     for k in keys:
         mat = final_embeddings[k]
-        # Valid if finite AND has norm > epsilon
         is_finite = np.isfinite(mat).all(axis=1)
+        # Relax norm check for sparse high-dim
         has_norm = np.linalg.norm(mat, axis=1) > eps
         keep_mask &= (is_finite & has_norm)
         
     dropped_count = n_rows - keep_mask.sum()
     print(f"  - Keeping {keep_mask.sum()} / {n_rows} rows. Dropping {dropped_count}.")
     
-    # 2. Filter Embeddings
     for k in keys:
         final_embeddings[k] = final_embeddings[k][keep_mask]
         
-    # 3. Update Mappings
     old_idx_to_cue = mappings['idx_to_cue']
     valid_indices = np.where(keep_mask)[0]
-    
     new_idx_to_cue = {new_i: old_idx_to_cue[old_i] for new_i, old_i in enumerate(valid_indices)}
     new_cue_to_idx = {cue: new_i for new_i, cue in new_idx_to_cue.items()}
     
     new_mappings = {
         'cue_to_idx': new_cue_to_idx,
         'idx_to_cue': new_idx_to_cue,
-        'response_to_idx': mappings['response_to_idx'] # responses unaffected
+        'response_to_idx': mappings['response_to_idx']
     }
     
     return final_embeddings, new_mappings
@@ -366,48 +465,73 @@ def align_and_sanitize_rows(final_embeddings: dict, mappings: dict, eps: float =
 
 def main():
     default_swow, default_passive, default_deranged, default_active, default_out = infer_default_paths()
+    default_activation_pkl = default_out / "activation_embeddings.pkl"
 
-    parser = argparse.ArgumentParser(description="Build Behavioral Vectors (Contrastive).")
-    parser.add_argument('--swow_path', type=Path, default=default_swow, help="Path to Human SWOW CSV")
-    parser.add_argument('--passive_dir', type=Path, default=default_passive, help="Real Logprobs")
-    parser.add_argument('--deranged_dir', type=Path, default=default_deranged, help="Deranged Logprobs")
-    parser.add_argument('--active_dir', type=Path, default=default_active, help="Generated JSONLs")
-    parser.add_argument('--output_dir', type=Path, default=default_out, help="Output Dir")
-    parser.add_argument('--n_components', type=int, default=300, help="SVD Dimensions")
+    parser = argparse.ArgumentParser(description="Build Behavioral Vectors (Matched Dims + Human).")
+    parser.add_argument('--swow_path', type=Path, default=default_swow)
+    parser.add_argument('--passive_dir', type=Path, default=default_passive)
+    parser.add_argument('--deranged_dir', type=Path, default=default_deranged)
+    parser.add_argument('--active_dir', type=Path, default=default_active)
+    parser.add_argument('--output_dir', type=Path, default=default_out)
+    parser.add_argument('--full_mode', action='store_true',
+                        help="Process all models (disables limited mode).")
+    parser.add_argument('--dim_strategy', choices=['activation', 'mapping', 'fixed'], default='activation',
+                        help="activation: match dims from activation_embeddings.pkl; "
+                             "mapping: use MODEL_TARGET_DIMS; fixed: use --fixed_dim.")
+    parser.add_argument('--activation_pkl', type=Path, default=default_activation_pkl,
+                        help="Path to activation embeddings pickle for --dim_strategy=activation.")
+    parser.add_argument('--fixed_dim', type=int, default=DEFAULT_FALLBACK_DIM,
+                        help="Target dim when using --dim_strategy=fixed or as general fallback.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
+    allowed_models = None if args.full_mode else LIMITED_MODE_MODELS
+    if allowed_models is not None:
+        print("[Mode] Limited mode enabled by default. Only processing human plus core models.")
+    else:
+        print("[Mode] Full mode enabled. Processing all available models.")
+
+    dim_lookup = {}
+    if args.dim_strategy == "activation":
+        dim_lookup = load_activation_dims(args.activation_pkl)
+        if not dim_lookup:
+            print(f"[Dims] No activation dims found. Falling back to MODEL_TARGET_DIMS/fixed_dim={args.fixed_dim}.")
+    elif args.dim_strategy == "mapping":
+        print("[Dims] Using MODEL_TARGET_DIMS mapping for target dimensions.")
+    else:
+        print(f"[Dims] Using fixed dimension: {args.fixed_dim}")
+    
     # 1. Vocab & Human Matrix
     human_df, mappings, vocab_set = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD)
     
-    # Build Human CSR (Counts)
     row = human_df['cue'].map(mappings['cue_to_idx']).values
     col = human_df['response_word'].map(mappings['response_to_idx']).values
     counts = pd.DataFrame({'row': row, 'col': col}).groupby(['row', 'col']).size().reset_index(name='c')
     human_mat = csr_matrix((counts['c'], (counts['row'], counts['col'])), 
                            shape=(len(mappings['cue_to_idx']), len(mappings['response_to_idx'])))
     
+    # Add Human Matrix to the set (it will be transformed to 300d)
     matrices = {'human_matrix': human_mat}
     
-    # 2. Ingest Data (Passive Real + Contrastive)
-    matrices.update(process_passive_behavior(args.passive_dir, args.deranged_dir, mappings, vocab_set))
+    # 2. Ingest Data
+    matrices.update(process_passive_behavior(args.passive_dir, args.deranged_dir, mappings, vocab_set,
+                                             allowed_models=allowed_models))
+    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set,
+                                              allowed_models=allowed_models))
     
-    # 3. Ingest Active
-    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set))
-    
-    if len(matrices) == 1:
-        print("WARNING: No model matrices created.")
+    if not matrices:
+        print("WARNING: No matrices created.")
         return
 
-    # 4. Transform (PPMI -> SVD)
+    # 3. Transform
     print("\n[Transformation] Applying PPMI + SVD...")
-    dense_results = derive_dense_embeddings(matrices, n_components=args.n_components)
+    dense_results = derive_dense_embeddings(matrices, dim_lookup, args.dim_strategy, args.fixed_dim)
     
-    # 5. Sanitize (Ensure row alignment)
+    # 4. Sanitize
     dense_results, mappings = align_and_sanitize_rows(dense_results, mappings)
     
-    # 6. Export
+    # 5. Export
     export_payload = {
         'embeddings': dense_results,
         'mappings': mappings
