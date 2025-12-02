@@ -1,3 +1,10 @@
-data/
-outputs/
+# Keep directory structure but ignore contents
+/data/**
+!/data/.gitkeep
+!/data/**/.gitkeep
+
+/outputs/**
+!/outputs/.gitkeep
+!/outputs/**/.gitkeep
+
 .DS_Store
