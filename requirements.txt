@@ -1,0 +1,13 @@
+# Core analytics stack
+pandas>=2.1
+numpy>=1.24
+scipy>=1.11
+scikit-learn>=1.3
+tqdm>=4.66
+
+# Plotting (for visualize/* scripts)
+matplotlib>=3.8
+seaborn>=0.13
+
+# Notebooks
+ipykernel>=6.29
