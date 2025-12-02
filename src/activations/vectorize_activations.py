@@ -16,8 +16,12 @@ from pathlib import Path
 
 # --- CONFIG ---
 BASE_DIR = Path(__file__).resolve().parents[2]
+SRC_DIR = BASE_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.append(str(SRC_DIR))
 INPUT_DIR = BASE_DIR / "outputs" / "raw_activations"
 MASTER_PKL = BASE_DIR / "outputs" / "matrices" / "behavioral_embeddings.pkl"
+SWOW_CSV = BASE_DIR / "data" / "SWOW" / "Human_SWOW-EN.R100.20180827.csv"
 OUTPUT_PKL = BASE_DIR / "outputs" / "matrices" / "activation_embeddings.pkl"
 
 # Map filenames to Clean Model Keys
@@ -29,12 +33,28 @@ FILENAME_TO_KEY = {
 }
 
 def load_master_mapping():
-    if not MASTER_PKL.exists():
-        print(f"❌ Error: Master embeddings not found at {MASTER_PKL}")
+    """
+    Load cue_to_idx mapping from behavioral embeddings if available,
+    otherwise derive it directly from the SWOW CSV (fresh bootstrap).
+    """
+    if MASTER_PKL.exists():
+        with open(MASTER_PKL, 'rb') as f:
+            data = pickle.load(f)
+        return data['mappings']['cue_to_idx']
+
+    print(f"⚠️  Master embeddings not found at {MASTER_PKL}. Building cue index from {SWOW_CSV.name}.")
+    if not SWOW_CSV.exists():
+        print(f"❌ Error: SWOW CSV not found at {SWOW_CSV}")
         sys.exit(1)
-    with open(MASTER_PKL, 'rb') as f:
-        data = pickle.load(f)
-    return data['mappings']['cue_to_idx']
+
+    try:
+        from behavior.vectorize_behavior import load_human_swow, MIN_FREQ_THRESHOLD
+    except Exception as e:
+        print(f"❌ Error: failed to import cue builder from behavior module: {e}")
+        sys.exit(1)
+
+    _, mappings, _ = load_human_swow(SWOW_CSV, min_freq=MIN_FREQ_THRESHOLD)
+    return mappings['cue_to_idx']
 
 def process_file(filepath, cue_to_idx):
     print(f"\nProcessing {filepath.name}...")
