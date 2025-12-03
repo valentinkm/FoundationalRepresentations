@@ -27,15 +27,25 @@ from sklearn.metrics import r2_score
 MIN_SAMPLES = 50
 
 # --- MAPPINGS ---
+# Embedding keys need to match what's actually stored in behavioral_embeddings.pkl
+# (e.g., they include an extra "-b" chunk). Map each available embedding variant to
+# its corresponding norms CSV. Missing models were removed to avoid false negatives.
 EMBEDDING_TO_NORMS_MAP = {
-    "passive_Llama-3.1-8B_instruct":      "llama-3.1-8b-instruct",
-    "passive_Llama-3.3-70B_instruct":     "llama-3.3-70b-instruct",
-    "passive_Mistral-Small-24b_instruct": "mistral-small-24b-instruct",
-    "passive_Qwen3-32b_instruct":         "qwen-3-32b-instruct",
-    "passive_falcon-3-10B_instruct":      "falcon-3-10b-instruct",
-    "passive_gemma-3-27b_instruct":       "gemma-3-27b-instruct",
-    "passive_gpt-oss-120b_instruct":      "gpt-oss-120b-instruct",
-    "passive_gpt-oss-20b_instruct":       "gpt-oss-20b-instruct",
+    "passive_gemma-3-27-b-instruct":                "gemma-3-27b-instruct",
+    "passive_gemma-3-27-b-instruct_shuffled":       "gemma-3-27b-instruct",
+    "passive_gemma-3-27-b-instruct_contrast":       "gemma-3-27b-instruct",
+
+    "passive_gpt-oss-20-b-instruct":                "gpt-oss-20b-instruct",
+    "passive_gpt-oss-20-b-instruct_shuffled":       "gpt-oss-20b-instruct",
+    "passive_gpt-oss-20-b-instruct_contrast":       "gpt-oss-20b-instruct",
+
+    "passive_mistral-small-24-b-instruct":          "mistral-small-24b-instruct",
+    "passive_mistral-small-24-b-instruct_shuffled": "mistral-small-24b-instruct",
+    "passive_mistral-small-24-b-instruct_contrast": "mistral-small-24b-instruct",
+
+    "passive_qwen-3-32-b-instruct":                 "qwen-3-32b-instruct",
+    "passive_qwen-3-32-b-instruct_shuffled":        "qwen-3-32b-instruct",
+    "passive_qwen-3-32-b-instruct_contrast":        "qwen-3-32b-instruct",
 }
 
 def load_embeddings(pkl_path):
