@@ -1,9 +1,14 @@
 """
-src/evaluation/run_norm_predictions.py
+src/evaluation/compare_representations.py
 
 Batched Ridge Regression Evaluation.
-Task A: Alignment (Predicting Human Norms)
-Task B: Introspection (Predicting Model's Own Norms)
+Task A: Alignment (Predicting Human Norms) -> FAST MODE: Sample 20 Global Targets from 288.
+Task B: Introspection (Predicting Model's Own Norms) -> FAST MODE: Keep ALL (~15) Norms per model.
+
+UPDATES:
+- FAST MODE: Row subsampling is DISABLED (uses full vocabulary overlap) to maximize R^2 accuracy.
+- FAST MODE: Only restricts the number of Human Norm targets (20).
+- Ensures 300d embeddings are processed if present in the pickle.
 """
 
 import pandas as pd
@@ -12,12 +17,14 @@ import pickle
 import sys
 import argparse
 import time
+import random
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import KFold, cross_val_score
+from collections import Counter
 
 # --- CONFIGURATION ---
 MIN_SAMPLES = 50 
@@ -87,27 +94,34 @@ def load_model_norms(norm_dir: Path):
 
 def parse_embedding_key(key):
     """Categorize embedding keys into types."""
+    # 1. Human Baseline
     if key == "human_matrix":
         return "Human", "Baseline"
     
+    # 2. Activations
     if key.startswith("activation_"):
         clean = key.replace("activation_", "").replace("-instruct", "")
         return clean, "Activation"
     
+    # 3. Behavioral
     if key.startswith("passive_"):
         clean = key.replace("passive_", "").replace("-instruct", "")
-        suffix = None
-        if clean.endswith("_300d"):
+        
+        # Check for 300d Suffix
+        suffix = ""
+        if "_300d" in clean:
             clean = clean.replace("_300d", "")
             suffix = "_300d"
+            
         if "_contrast" in clean:
             clean = clean.replace("_contrast", "")
-            etype = "Behavior_Contrastive" + (suffix or "")
+            etype = "Behavior_Contrastive" + suffix
         elif "_shuffled" in clean:
             clean = clean.replace("_shuffled", "")
-            etype = "Behavior_Shuffled" + (suffix or "")
+            etype = "Behavior_Shuffled" + suffix
         else:
-            etype = "Behavior_Standard" + (suffix or "")
+            etype = "Behavior_Standard" + suffix
+            
         return clean, etype
             
     return "Unknown", "Unknown"
@@ -122,10 +136,26 @@ def evaluate_embedding(X, y, folds, jobs):
     scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=jobs)
     return scores.mean(), scores.std()
 
-def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
+def _save_buffer(buffer, path):
+    if not buffer: return
+    new_df = pd.DataFrame(buffer)
+    if path.exists():
+        try:
+            old_df = pd.read_csv(path)
+            # Remove duplicates based on key columns, keeping the newest run
+            combined = pd.concat([old_df, new_df], ignore_index=True)
+            combined = combined.drop_duplicates(subset=['Model', 'Embedding_Type', 'Norm'], keep='last')
+            combined.to_csv(path, index=False)
+        except Exception as e:
+            print(f"⚠️ CSV Error: {e}. Backup saved.")
+            new_df.to_csv(path.parent / f"backup_{int(time.time())}.csv", index=False)
+    else:
+        new_df.to_csv(path, index=False)
+    print(f"  💾 Saved {len(buffer)} records to {path.name}")
+
+def run_self_predictions(embeddings_to_test, cue_to_idx, model_norms, out_csv, max_samples=None):
     """
-    Predict each model's OWN norms using its OWN behavioral embeddings.
-    Uses 'Canonical Matching' with verbose logging.
+    Predict each model's OWN norms using its OWN embeddings (Behavior + Activation).
     """
     if not model_norms:
         print("⚠️ Self-prediction skipped: no model norms found.")
@@ -133,54 +163,57 @@ def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
 
     print(f"\n{'='*60}")
     print(f"SELF-PREDICTION ROUTINE")
+    if max_samples:
+        print(f"   - Row Limit: {max_samples}")
+    else:
+        print(f"   - Row Limit: None (Full Overlap)")
     print(f"{'='*60}")
 
-    # --- HELPER: Canonical Name ---
     def to_canonical(name):
         clean = name.lower().replace("-instruct", "").replace("-base", "")
         return clean.replace("-", "").replace("_", "").strip()
 
-    # 1. Build Lookup Table
     norm_lookup = {}
     print(f"[Self-Pred] 🔍 indexing {len(model_norms)} norm files...")
     for stem, df in model_norms.items():
         key = to_canonical(stem)
         norm_lookup[key] = (stem, df)
 
-    rows = []
-    
     # 2. Iterate and Match
-    for item in behavior_items:
+    for item in embeddings_to_test:
         model = item['model']
         emb_type = item['type']
         X_full = item['matrix']
         
+        # Match model embedding to its own norm file
         search_key = to_canonical(model)
         match = norm_lookup.get(search_key)
         
-        # --- LOGGING MATCH STATUS ---
         if match is None:
-            print(f"❌ SKIP: {model:<30} | No CSV found for key: '{search_key}'")
             continue
             
         original_name, df = match
-        print(f"✅ PROC: {model:<30} | Matched to: {original_name}.csv")
+        print(f"✅ PROC: {model:<30} | {emb_type:<25} | Matched: {original_name}")
 
-        # 3. Inner Loop (Norms)
-        norm_col = 'norm' if 'norm' in df.columns else 'norm_name'
-        grouped = df.groupby(norm_col)
-        
-        # Use tqdm for visual progress on the specific norms
+        rng = random.Random(search_key) # Consistent seeding
+
+        model_buffer = [] 
         processed_count = 0
-        skipped_count = 0
         
-        for norm_name, sub in tqdm(grouped, desc=f"     -> {emb_type[:15]}...", leave=False):
+        norm_col = 'norm' if 'norm' in df.columns else 'norm_name'
+        available_norms = sorted(df[norm_col].unique()) 
+
+        for norm_name in tqdm(available_norms, desc=f"     -> {emb_type[:15]}...", leave=False):
+            sub = df[df[norm_col] == norm_name]
             words = sub['word'].astype(str).str.lower().str.strip()
-            overlap = [w for w in words.unique() if w in cue_to_idx]
+            overlap = sorted(list(set([w for w in words.unique() if w in cue_to_idx])))
             
             if len(overlap) < MIN_SAMPLES:
-                skipped_count += 1
                 continue
+            
+            # Subsample Rows (Only if max_samples is set)
+            if max_samples and len(overlap) > max_samples:
+                overlap = rng.sample(overlap, max_samples)
             
             idxs = [cue_to_idx[w] for w in overlap]
             y_map = sub.groupby('word')['cleaned_rating'].mean().to_dict()
@@ -189,7 +222,7 @@ def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
             
             r2, std = evaluate_embedding(X, y, CV_FOLDS, N_JOBS)
             
-            rows.append({
+            model_buffer.append({
                 "Model": model,
                 "Embedding_Type": emb_type,
                 "Norm_File": original_name,
@@ -201,29 +234,11 @@ def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
             })
             processed_count += 1
         
-        print(f"     -> Finished. Computed: {processed_count} norms. (Skipped {skipped_count} low overlap)")
+        if model_buffer:
+            _save_buffer(model_buffer, out_csv)
+        else:
+            print(f"     -> Finished (No valid norms found).")
 
-    if rows:
-        _save_buffer(rows, out_csv)
-    else:
-        print("⚠️ Self-prediction produced no records.")
-
-def _save_buffer(buffer, path):
-    if not buffer: return
-    new_df = pd.DataFrame(buffer)
-    if path.exists():
-        try:
-            old_df = pd.read_csv(path)
-            combined = pd.concat([old_df, new_df], ignore_index=True)
-            # Remove duplicates based on key columns, keeping the newest run
-            combined = combined.drop_duplicates(subset=['Model', 'Embedding_Type', 'Norm'], keep='last')
-            combined.to_csv(path, index=False)
-        except Exception as e:
-            print(f"⚠️ CSV Error: {e}. Backup saved.")
-            new_df.to_csv(path.parent / f"backup_{int(time.time())}.csv", index=False)
-    else:
-        new_df.to_csv(path, index=False)
-    print(f"  💾 Saved {len(buffer)} records to {path.name}")
 
 # =============================================================================
 # MAIN
@@ -232,18 +247,32 @@ def _save_buffer(buffer, path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoketest", action="store_true", help="Run fast integrity check.")
+    parser.add_argument("--fast_mode", action="store_true", help="Limit Norm targets, but keep full row count.")
     args = parser.parse_args()
 
     global CV_FOLDS, N_JOBS
     
-    # --- SMOKETEST CONFIG ---
+    # --- CONFIGURATION LOGIC ---
+    
+    # ROW LIMITS:
+    # User requested to "bump up predictive performance". 
+    # Therefore, we remove row limits (None) to use all available data, 
+    # even in fast mode.
+    MAX_SAMPLES = None 
+    
+    # NORM LIMITS (Task A - Human):
+    # Fast mode restricts global targets to 20 to save time.
+    HUMAN_NORM_LIMIT = 20 if args.fast_mode else None
+
+    # SMOKETEST OVERRIDES
     if args.smoketest:
         print("\n🔥 SMOKETEST MODE ENABLED 🔥")
         CV_FOLDS = 2
         N_JOBS = 1 
+        HUMAN_NORM_LIMIT = 1
+        MAX_SAMPLES = 100
         out_csv = OUTPUT_CSV.parent / "norm_prediction_scores_SMOKETEST.csv"
         self_out_csv = SELF_OUTPUT_CSV.parent / "self_prediction_scores_SMOKETEST.csv"
-        print(f"   Outputs will be saved to: {out_csv.name} & {self_out_csv.name}")
     else:
         out_csv = OUTPUT_CSV
         self_out_csv = SELF_OUTPUT_CSV
@@ -257,44 +286,51 @@ def main():
     model_norms = load_model_norms(MODEL_NORMS_DIR)
     
     cue_to_idx = behav_data['mappings']['cue_to_idx']
-    norm_list = norm_df['norm_name'].unique()
+    norm_list = sorted(norm_df['norm_name'].unique()) 
     
-    if args.smoketest:
-        norm_list = norm_list[:1] # Only run 1 norm for speed
+    # --- GLOBAL NORM REDUCTION (HUMAN LOOP) ---
+    if HUMAN_NORM_LIMIT:
+        random.seed(42) # Fixed Seed for Norm Selection
+        norm_list = random.sample(norm_list, HUMAN_NORM_LIMIT)
+        print(f"\n🚀 FAST MODE: Restricted to {len(norm_list)} Human Norms.")
+        print(f"   (Row subsampling is DISABLED to maximize R^2 scores)")
 
     # 2. Collect Embeddings
     all_embeddings = []
     
+    # Explicitly list all wanted types, including 300d
     WANTED_TYPES = {
-        "Baseline", 
-        "Activation", 
-        "Behavior_Contrastive", 
-        "Behavior_Standard",
-        "Behavior_Contrastive_300d", 
-        "Behavior_Standard_300d"
+        "Baseline", "Activation", 
+        "Behavior_Contrastive", "Behavior_Standard",
+        "Behavior_Contrastive_300d", "Behavior_Standard_300d"
     }
     
-    for key, mat in behav_data['embeddings'].items():
-        model, type_ = parse_embedding_key(key)
-        if type_ in WANTED_TYPES:
-            all_embeddings.append({"key": key, "matrix": mat, "model": model, "type": type_})
-            
-    for key, mat in act_data['embeddings'].items():
-        model, type_ = parse_embedding_key(key)
-        if type_ in WANTED_TYPES:
-            all_embeddings.append({"key": key, "matrix": mat, "model": model, "type": type_})
+    # Helper to gather
+    def gather_embeddings(source_dict):
+        for key, mat in source_dict.items():
+            model, type_ = parse_embedding_key(key)
+            if type_ in WANTED_TYPES:
+                all_embeddings.append({"key": key, "matrix": mat, "model": model, "type": type_})
 
+    gather_embeddings(behav_data.get('embeddings', {}))
+    gather_embeddings(act_data.get('embeddings', {}))
+    
     all_embeddings.sort(key=lambda x: (x['model'], x['type']))
 
+    # --- DEBUG: PRINT FOUND TYPES ---
     print(f"\n✅ Found {len(all_embeddings)} Target Embedding Sources")
+    type_counts = Counter([x['type'] for x in all_embeddings])
+    print("   Breakdown:", dict(type_counts))
+    if "Behavior_Standard_300d" not in type_counts:
+        print("⚠️  WARNING: No 'Behavior_Standard_300d' found. Check input pickle file.")
 
     # 3. Resume Check (Human Norms)
     processed_configs = set()
     if out_csv.exists() and not args.smoketest:
         try:
             df_exist = pd.read_csv(out_csv)
+            # Create a set of (Model, Type, Norm) tuples
             processed_configs = set(zip(df_exist['Model'], df_exist['Embedding_Type'], df_exist['Norm']))
-            if processed_configs: print(f"  -> 🔄 Resuming: Found {len(processed_configs)} completed records.")
         except: pass
 
     # 4. Main Loop: Human Norm Prediction
@@ -306,19 +342,20 @@ def main():
         X_full = item['matrix']
         max_rows = X_full.shape[0]
         
-        # Skip if already done
+        # Filter norms that are already done
         norms_to_run = [n for n in norm_list if (model, emb_type, n) not in processed_configs]
+        
+        if not norms_to_run: continue
         
         print(f"\n{'='*60}")
         print(f"Processing: {model} - {emb_type}")
         print(f"  -> Shape: {X_full.shape}")
         print(f"  -> Remaining Norms: {len(norms_to_run)} / {len(norm_list)}")
         print(f"{'='*60}")
-        
-        if not norms_to_run:
-            continue
 
-        # Create valid map once per Model
+        clean_name = model.lower().replace("-instruct", "").replace("-base", "").replace("-", "").strip()
+        rng = random.Random(clean_name)
+
         valid_map = {word: idx for word, idx in cue_to_idx.items() if idx < max_rows}
 
         try:
@@ -329,22 +366,19 @@ def main():
                 if sub_df.empty: continue
 
                 norm_map = sub_df.set_index('word')['human_rating'].to_dict()
+                overlap = sorted(list(norm_map.keys())) 
                 
-                valid_indices = []
-                y_vals = []
+                if len(overlap) < MIN_SAMPLES: continue
+
+                # ROW SAMPLING: Only apply if MAX_SAMPLES is set (it is None in Fast Mode now)
+                if MAX_SAMPLES and len(overlap) > MAX_SAMPLES:
+                    overlap = rng.sample(overlap, MAX_SAMPLES)
                 
-                for word, rating in norm_map.items():
-                    valid_indices.append(valid_map[word])
-                    y_vals.append(rating)
+                idxs = [valid_map[w] for w in overlap]
+                y = np.array([norm_map[w] for w in overlap])
                 
-                if len(valid_indices) < MIN_SAMPLES:
-                    continue
-                
-                idxs = np.array(valid_indices)
-                y = np.array(y_vals)
-                
-                # Check NaNs
                 X_sub = X_full[idxs]
+                # Safety check for NaNs in embeddings
                 if not np.isfinite(X_sub).all():
                     mask = np.isfinite(X_sub).all(axis=1)
                     X_sub = X_sub[mask]
@@ -372,16 +406,21 @@ def main():
             continue
 
     _save_buffer(results_buffer, out_csv)
-    print(f"\n✅ Norm prediction complete. Results: {out_csv}")
+    print(f"\n✅ Human Norm prediction complete. Results: {out_csv}")
 
-    # 5. Secondary Loop: Self-Prediction (Behavior only)
-    # We only run self-prediction on Behavioral embeddings, as Activation mappings are tricky/less relevant here
-    behavior_items = [a for a in all_embeddings if a['type'].startswith("Behavior")]
+    # 5. Secondary Loop: Self-Prediction
+    # Filter out "Baseline" because humans don't have model norm files
+    # Note: 300d types start with "Behavior", so they are included here.
+    self_pred_items = [
+        a for a in all_embeddings 
+        if a['type'].startswith("Behavior") or a['type'] == "Activation"
+    ]
     
-    if behavior_items:
-        run_self_predictions(behavior_items, cue_to_idx, model_norms, self_out_csv)
+    if self_pred_items:
+        # Pass MAX_SAMPLES (which is None in fast mode) to ensure full accuracy
+        run_self_predictions(self_pred_items, cue_to_idx, model_norms, self_out_csv, max_samples=MAX_SAMPLES)
     else:
-        print("⚠️ No behavioral embeddings found for self-prediction.")
+        print("⚠️ No suitable embeddings found for self-prediction.")
 
 if __name__ == "__main__":
     main()
