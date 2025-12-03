@@ -2,12 +2,13 @@
 src/evaluation/compare_representations.py
 
 Mode: STRICT INTROSPECTION BENCHMARK.
-Target: Compare Activation vs. ALL Behavior Variants (Std, Contrast, 300d) on Self-Norm Prediction.
+Target: Compare Activation vs. ALL Behavior Variants on Self-Norm Prediction.
 
-CORE LOGIC FIX:
-- Groups all embedding variants (contrast, 300d, standard) under a single "Model Family".
-- Validates that the Family has at least one Activation and one Behavior source.
-- Runs regression on ALL found variants against the shared norms.
+LOGIC:
+1. Inventory: specific Activation & Behavior keys.
+2. Grouping: Aggregates variants (Standard, Contrastive, 300d) by Model Family.
+3. Filtering: ONLY processes families with BOTH Activation AND Behavior sources.
+4. Intersection: ONLY runs on norms shared by ALL valid families (with N>=1000).
 """
 
 import pandas as pd
@@ -15,7 +16,6 @@ import numpy as np
 import pickle
 import sys
 import argparse
-import time
 import random
 from pathlib import Path
 from tqdm import tqdm
@@ -42,18 +42,28 @@ OUTPUT_CSV = BASE_DIR / "outputs" / "results" / "self_prediction_scores.csv"
 MODEL_NORMS_DIR = BASE_DIR / "outputs" / "raw_behavior" / "model_norms"
 
 # =============================================================================
-# PARSING LOGIC (THE FIX)
+# PARSING LOGIC
 # =============================================================================
+
+def normalize_name(name):
+    """
+    Normalizes names to handle mismatches (e.g., '27-b' vs '27b').
+    Keeps 'instruct' vs 'base' distinct to prevent overwriting.
+    """
+    clean = name.lower().strip()
+    # Remove separators
+    clean = clean.replace("-", "").replace("_", "")
+    return clean
 
 def parse_model_family_and_type(key):
     """
     Decodes the dictionary key into:
-    1. Model Family (normalized root name, e.g., 'gemma327b')
+    1. Model Family (normalized name)
     2. Embedding Type (e.g., 'Behavior_Contrastive_300d')
     """
     if key == "human_matrix": return "Human", "Baseline"
     
-    # 1. Determine Broad Category
+    # 1. Determine Broad Category & Clean Prefix
     if key.startswith("activation_"):
         category = "Activation"
         clean = key.replace("activation_", "")
@@ -63,21 +73,19 @@ def parse_model_family_and_type(key):
     else:
         return None, None
 
-    # 2. Extract Variants (flags)
+    # 2. Extract Variants
     is_300d = "_300d" in clean
     is_contrast = "_contrast" in clean
     is_shuffled = "_shuffled" in clean
 
-    # 3. Clean the Model Name (Remove variants to find the STEM)
-    # Remove suffixes
+    # 3. Clean the Model Name (Remove suffixes to find the FAMILY)
     stem = clean.replace("_300d", "").replace("_contrast", "").replace("_shuffled", "")
-    # Remove instruction tuning info (we treat base/instruct as same family for grouping, or separate?)
-    # Based on your filenames, they seem to be distinct files, but let's normalize separators.
-    stem = stem.replace("-instruct", "").replace("-base", "") 
-    stem = stem.replace("-", "").replace("_", "") # Normalize "27-b" -> "27b"
-    stem = stem.lower().strip()
+    
+    # NOTE: We normalize dashes but KEEP 'instruct'/'base' if present 
+    # so we don't mix up different model versions.
+    stem = normalize_name(stem)
 
-    # 4. Construct Specific Type Label
+    # 4. Construct Type Label
     if category == "Activation":
         final_type = "Activation"
     else:
@@ -113,8 +121,8 @@ def load_model_norms(norm_dir: Path):
             df['cleaned_rating'] = pd.to_numeric(df['cleaned_rating'], errors='coerce')
             df = df.dropna(subset=['cleaned_rating'])
             
-            # Use same normalization logic for Norm Keys
-            clean_name = fp.stem.lower().replace("-instruct", "").replace("-base", "").replace("-", "").replace("_", "")
+            # Normalize key to match embedding keys
+            clean_name = normalize_name(fp.stem)
             data[clean_name] = (fp.stem, df) 
         except Exception: pass
     print(f"Loaded {len(data)} model norm files.")
@@ -152,9 +160,14 @@ def main():
     args = parser.parse_args()
 
     # --- SETTINGS ---
-    REQUIRED_SAMPLES = 1000 
-    TARGET_NORM_COUNT = 5 if args.fast_mode else None 
-    
+    if args.fast_mode:
+        print("\n🚀 FAST MODE: Strict Introspection Enabled")
+        REQUIRED_SAMPLES = 1000 
+        TARGET_NORM_COUNT = 5  # Sample 5 shared norms
+    else:
+        REQUIRED_SAMPLES = 1000
+        TARGET_NORM_COUNT = None # All shared norms
+
     if args.smoketest:
         print("\n🔥 SMOKETEST MODE ENABLED")
         CV_FOLDS = 2
@@ -191,8 +204,8 @@ def main():
     # 3. Validate Families
     valid_families = []
     
-    print(f"{'Model Family':<20} | {'Act':<5} | {'Std':<5} | {'Cont':<5} | {'300d':<5} | {'Norms':<5} | Status")
-    print("-" * 80)
+    print(f"{'Model Family':<25} | {'Act':<5} | {'Std':<5} | {'Cont':<5} | {'300d':<5} | {'Norms':<5} | Status")
+    print("-" * 85)
 
     for family in sorted(model_groups.keys()):
         types = model_groups[family].keys()
@@ -201,7 +214,13 @@ def main():
         has_std = any("Standard" in t for t in types)
         has_cont = any("Contrastive" in t for t in types)
         has_300 = any("300d" in t for t in types)
-        has_norms = family in model_norms
+        
+        # Check if norms exist for this family key (normalized)
+        has_norms = False
+        for norm_key in model_norms.keys():
+            if norm_key in family or family in norm_key: # Fuzzy match for safety
+                has_norms = True
+                break
 
         # CRITERIA: Must have Activation AND (Standard OR Contrastive) AND Norms
         is_valid = has_act and (has_std or has_cont) and has_norms
@@ -210,7 +229,7 @@ def main():
         if is_valid: valid_families.append(family)
 
         if args.smoketest or is_valid:
-            print(f"{family:<20} | {str(has_act)[0]:<5} | {str(has_std)[0]:<5} | {str(has_cont)[0]:<5} | {str(has_300)[0]:<5} | {str(has_norms)[0]:<5} | {status}")
+            print(f"{family:<25} | {str(has_act)[0]:<5} | {str(has_std)[0]:<5} | {str(has_cont)[0]:<5} | {str(has_300)[0]:<5} | {str(has_norms)[0]:<5} | {status}")
 
     print(f"\n🎯 Qualified Model Families: {len(valid_families)}")
     if not valid_families:
@@ -223,7 +242,10 @@ def main():
     family_valid_norms = {}
     
     for family in valid_families:
-        original_name, df_norms = model_norms[family]
+        # Find the matching norm file
+        matched_key = next(k for k in model_norms.keys() if k in family or family in k)
+        original_name, df_norms = model_norms[matched_key]
+        
         norm_col = 'norm' if 'norm' in df_norms.columns else 'norm_name'
         
         valid_set = set()
@@ -241,6 +263,7 @@ def main():
     print(f"✅ Shared Valid Norms: {len(sorted_shared)}")
     if not sorted_shared:
         print(f"❌ No norms meet the {REQUIRED_SAMPLES} word requirement across all models.")
+        print(f"   (Try reducing REQUIRED_SAMPLES if this is too strict)")
         sys.exit(1)
 
     # Select Targets
@@ -252,24 +275,25 @@ def main():
         target_norms = sorted_shared
 
     # 5. Execution Loop
-    print(f"\n🚀 STARTING BENCHMARK")
+    print(f"\n🚀 STARTING BENCHMARK (Running only on Qualified Families)")
     results_buffer = []
 
     for family in valid_families:
         print(f"\nModel Family: {family}")
-        original_norm_name, df_norms = model_norms[family]
+        
+        # Find norm file again
+        matched_key = next(k for k in model_norms.keys() if k in family or family in k)
+        original_norm_name, df_norms = model_norms[matched_key]
         norm_col = 'norm' if 'norm' in df_norms.columns else 'norm_name'
         
-        # Iterate over ALL types found for this family
         variants = sorted(model_groups[family].keys())
         
         for etype in variants:
-            if "Shuffled" in etype: continue # Optional: Skip shuffled to save time
+            if "Shuffled" in etype: continue 
             
             X_full = model_groups[family][etype]
 
             for norm_name in target_norms:
-                # Re-extract and sample consistently
                 sub = df_norms[df_norms[norm_col] == norm_name]
                 words = sub['word'].astype(str).str.lower().str.strip()
                 overlap = sorted(list(set([w for w in words if w in cue_to_idx])))
