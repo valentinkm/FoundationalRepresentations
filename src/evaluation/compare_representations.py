@@ -1,8 +1,9 @@
 """
 src/evaluation/run_norm_predictions.py
 
-Batched Ridge Regression.
-OPTIMIZED: Parallelized, No PCA, Streamlined Loop.
+Batched Ridge Regression Evaluation.
+Task A: Alignment (Predicting Human Norms)
+Task B: Introspection (Predicting Model's Own Norms)
 """
 
 import pandas as pd
@@ -17,7 +18,6 @@ from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import KFold, cross_val_score
-from collections import defaultdict
 
 # --- CONFIGURATION ---
 MIN_SAMPLES = 50 
@@ -85,17 +85,8 @@ def load_model_norms(norm_dir: Path):
     print(f"Loaded {len(data)} model norm files.")
     return data
 
-def normalize_model_name(raw: str) -> str:
-    import re
-    name = raw.strip().lower().replace(' ', '-').replace('_', '-')
-    name = re.sub(r'(?<=[a-z])(?=\d)', '-', name)
-    name = re.sub(r'(?<=\d)(?=[a-z])', '-', name)
-    while '--' in name:
-        name = name.replace('--', '-')
-    name = name.replace('-b-', 'b-')
-    return name
-
 def parse_embedding_key(key):
+    """Categorize embedding keys into types."""
     if key == "human_matrix":
         return "Human", "Baseline"
     
@@ -122,62 +113,73 @@ def parse_embedding_key(key):
     return "Unknown", "Unknown"
 
 def evaluate_embedding(X, y, folds, jobs):
-    # Standardize -> RidgeCV
-    # RidgeCV with 'auto' mode usually uses efficient Leave-One-Out SVD
+    """Standardized Ridge Regression with Cross-Validation."""
     model = make_pipeline(
         StandardScaler(),
         RidgeCV(alphas=ALPHAS, scoring='r2')
     )
-    
-    # Use standard KFold (Shuffle=True) instead of RepeatedKFold to reduce overhead
     cv = KFold(n_splits=folds, shuffle=True, random_state=42)
-    
-    # Run the CV in parallel
     scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=jobs)
     return scores.mean(), scores.std()
 
 def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
-    """Predict each model's own norms for behavioral embeddings."""
+    """
+    Predict each model's OWN norms using its OWN behavioral embeddings.
+    Uses 'Canonical Matching' with verbose logging.
+    """
     if not model_norms:
         print("⚠️ Self-prediction skipped: no model norms found.")
         return
 
-    # --- FIX START ---
-    # Build lookup from normalized stem -> dataframe
-    # We must explicitly strip "-instruct" because parse_embedding_key strips it from the model name
+    print(f"\n{'='*60}")
+    print(f"SELF-PREDICTION ROUTINE")
+    print(f"{'='*60}")
+
+    # --- HELPER: Canonical Name ---
+    def to_canonical(name):
+        clean = name.lower().replace("-instruct", "").replace("-base", "")
+        return clean.replace("-", "").replace("_", "").strip()
+
+    # 1. Build Lookup Table
     norm_lookup = {}
+    print(f"[Self-Pred] 🔍 indexing {len(model_norms)} norm files...")
     for stem, df in model_norms.items():
-        clean_key = normalize_model_name(stem).replace("-instruct", "")
-        norm_lookup[clean_key] = df
-    # --- FIX END ---
+        key = to_canonical(stem)
+        norm_lookup[key] = (stem, df)
 
     rows = []
     
-    # Debug print to ensure keys are matching now
-    print(f"[Self-Pred] Lookup Keys Available: {list(norm_lookup.keys())}")
-
+    # 2. Iterate and Match
     for item in behavior_items:
         model = item['model']
         emb_type = item['type']
-        key = item['key']
         X_full = item['matrix']
         
-        # Ensure the model key matches the lookup key format
-        norm_key = normalize_model_name(model).replace("-instruct", "")
+        search_key = to_canonical(model)
+        match = norm_lookup.get(search_key)
         
-        df = norm_lookup.get(norm_key)
-        
-        if df is None:
-            # Optional: Print what failed to match to help debug
-            # print(f"  [Skip] No norms found for {model} (Looked for: {norm_key})")
+        # --- LOGGING MATCH STATUS ---
+        if match is None:
+            print(f"❌ SKIP: {model:<30} | No CSV found for key: '{search_key}'")
             continue
+            
+        original_name, df = match
+        print(f"✅ PROC: {model:<30} | Matched to: {original_name}.csv")
 
+        # 3. Inner Loop (Norms)
         norm_col = 'norm' if 'norm' in df.columns else 'norm_name'
-        for norm_name, sub in df.groupby(norm_col):
+        grouped = df.groupby(norm_col)
+        
+        # Use tqdm for visual progress on the specific norms
+        processed_count = 0
+        skipped_count = 0
+        
+        for norm_name, sub in tqdm(grouped, desc=f"     -> {emb_type[:15]}...", leave=False):
             words = sub['word'].astype(str).str.lower().str.strip()
             overlap = [w for w in words.unique() if w in cue_to_idx]
             
             if len(overlap) < MIN_SAMPLES:
+                skipped_count += 1
                 continue
             
             idxs = [cue_to_idx[w] for w in overlap]
@@ -190,19 +192,21 @@ def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
             rows.append({
                 "Model": model,
                 "Embedding_Type": emb_type,
-                "Norm_File": norm_key,
+                "Norm_File": original_name,
                 "Norm": norm_name,
                 "N_Samples": len(y),
                 "Dimensions": X_full.shape[1],
                 "R2_Mean": r2,
                 "R2_Std": std
             })
+            processed_count += 1
+        
+        print(f"     -> Finished. Computed: {processed_count} norms. (Skipped {skipped_count} low overlap)")
 
     if rows:
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
-        print(f"  💾 Saved {len(rows)} self-prediction records to {out_csv.name}")
+        _save_buffer(rows, out_csv)
     else:
-        print("⚠️ Self-prediction produced no records (insufficient overlap or missing norms).")
+        print("⚠️ Self-prediction produced no records.")
 
 def _save_buffer(buffer, path):
     if not buffer: return
@@ -210,8 +214,8 @@ def _save_buffer(buffer, path):
     if path.exists():
         try:
             old_df = pd.read_csv(path)
-            # Remove duplicates if we are re-running parts
             combined = pd.concat([old_df, new_df], ignore_index=True)
+            # Remove duplicates based on key columns, keeping the newest run
             combined = combined.drop_duplicates(subset=['Model', 'Embedding_Type', 'Norm'], keep='last')
             combined.to_csv(path, index=False)
         except Exception as e:
@@ -232,15 +236,17 @@ def main():
 
     global CV_FOLDS, N_JOBS
     
+    # --- SMOKETEST CONFIG ---
     if args.smoketest:
         print("\n🔥 SMOKETEST MODE ENABLED 🔥")
         CV_FOLDS = 2
         N_JOBS = 1 
-        norm_limit = 1
         out_csv = OUTPUT_CSV.parent / "norm_prediction_scores_SMOKETEST.csv"
+        self_out_csv = SELF_OUTPUT_CSV.parent / "self_prediction_scores_SMOKETEST.csv"
+        print(f"   Outputs will be saved to: {out_csv.name} & {self_out_csv.name}")
     else:
         out_csv = OUTPUT_CSV
-        norm_limit = None
+        self_out_csv = SELF_OUTPUT_CSV
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     
@@ -254,7 +260,7 @@ def main():
     norm_list = norm_df['norm_name'].unique()
     
     if args.smoketest:
-        norm_list = norm_list[:1]
+        norm_list = norm_list[:1] # Only run 1 norm for speed
 
     # 2. Collect Embeddings
     all_embeddings = []
@@ -282,7 +288,7 @@ def main():
 
     print(f"\n✅ Found {len(all_embeddings)} Target Embedding Sources")
 
-    # Resume Check
+    # 3. Resume Check (Human Norms)
     processed_configs = set()
     if out_csv.exists() and not args.smoketest:
         try:
@@ -291,16 +297,16 @@ def main():
             if processed_configs: print(f"  -> 🔄 Resuming: Found {len(processed_configs)} completed records.")
         except: pass
 
+    # 4. Main Loop: Human Norm Prediction
     results_buffer = []
-    behavior_items = [a for a in all_embeddings if a['type'].startswith("Behavior")]
-
-    # 3. Main Loop
+    
     for item in all_embeddings:
         model = item['model']
         emb_type = item['type']
         X_full = item['matrix']
         max_rows = X_full.shape[0]
         
+        # Skip if already done
         norms_to_run = [n for n in norm_list if (model, emb_type, n) not in processed_configs]
         
         print(f"\n{'='*60}")
@@ -312,12 +318,11 @@ def main():
         if not norms_to_run:
             continue
 
-        # OPTIMIZATION: Create valid map once per Model
+        # Create valid map once per Model
         valid_map = {word: idx for word, idx in cue_to_idx.items() if idx < max_rows}
 
         try:
             for norm in tqdm(norms_to_run, desc=f"{model} [{emb_type}]"):
-                # Fast subsetting
                 sub_df = norm_df[norm_df['norm_name'] == norm]
                 sub_df = sub_df[sub_df['word'].isin(valid_map.keys())]
 
@@ -329,7 +334,6 @@ def main():
                 y_vals = []
                 
                 for word, rating in norm_map.items():
-                    # No need to check 'if word in cue_to_idx' again due to pre-filter
                     valid_indices.append(valid_map[word])
                     y_vals.append(rating)
                 
@@ -339,16 +343,14 @@ def main():
                 idxs = np.array(valid_indices)
                 y = np.array(y_vals)
                 
-                # Check NaNs on subset only (Faster than checking whole X)
+                # Check NaNs
                 X_sub = X_full[idxs]
                 if not np.isfinite(X_sub).all():
-                    # Fallback: remove NaN rows
                     mask = np.isfinite(X_sub).all(axis=1)
                     X_sub = X_sub[mask]
                     y = y[mask]
                     if len(y) < MIN_SAMPLES: continue
                 
-                # Run Evaluation (Parallelized)
                 r2, std = evaluate_embedding(X_sub, y, CV_FOLDS, N_JOBS)
                 
                 results_buffer.append({
@@ -372,11 +374,12 @@ def main():
     _save_buffer(results_buffer, out_csv)
     print(f"\n✅ Norm prediction complete. Results: {out_csv}")
 
-    # Self-prediction (behavioral embeddings only)
+    # 5. Secondary Loop: Self-Prediction (Behavior only)
+    # We only run self-prediction on Behavioral embeddings, as Activation mappings are tricky/less relevant here
+    behavior_items = [a for a in all_embeddings if a['type'].startswith("Behavior")]
+    
     if behavior_items:
-        self_out = SELF_OUTPUT_CSV
-        self_out.parent.mkdir(parents=True, exist_ok=True)
-        run_self_predictions(behavior_items, cue_to_idx, model_norms, self_out)
+        run_self_predictions(behavior_items, cue_to_idx, model_norms, self_out_csv)
     else:
         print("⚠️ No behavioral embeddings found for self-prediction.")
 
