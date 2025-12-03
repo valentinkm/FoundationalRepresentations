@@ -1,14 +1,15 @@
 """
 src/evaluation/compare_representations.py
 
-Mode: STRICT INTROSPECTION BENCHMARK.
-Target: Compare Activation vs. ALL Behavior Variants on Self-Norm Prediction.
+STRICT OVERLAP MODE:
+1. Scans Activation Embeddings to find available models.
+2. Filters Behavioral Embeddings to ONLY include models found in step 1.
+3. Runs Full Evaluation (Task A & Task B) on this intersection.
 
-LOGIC:
-1. Inventory: specific Activation & Behavior keys.
-2. Grouping: Aggregates variants (Standard, Contrastive, 300d) by Model Family.
-3. Filtering: ONLY processes families with BOTH Activation AND Behavior sources.
-4. Intersection: ONLY runs on norms shared by ALL valid families (with N>=1000).
+CONFIGURATION:
+- MAX_SAMPLES = None (Uses 100% of available overlapping vocabulary).
+- Tracks 'N_Samples' explicitly.
+- Ensures 300d embeddings are included if the model exists in activations.
 """
 
 import pandas as pd
@@ -16,6 +17,7 @@ import numpy as np
 import pickle
 import sys
 import argparse
+import time
 import random
 from pathlib import Path
 from tqdm import tqdm
@@ -23,9 +25,16 @@ from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import KFold, cross_val_score
-from collections import defaultdict
+from collections import Counter
 
 # --- CONFIGURATION ---
+# CRITICAL: Set to None to use ALL available data points (words)
+MAX_SAMPLES = None 
+
+# Minimum overlap required to attempt a regression
+MIN_SAMPLES = 50 
+
+# Ridge Regression Hyperparameters
 ALPHAS = np.logspace(-2, 6, 12) 
 CV_FOLDS = 5
 N_JOBS = -1
@@ -38,69 +47,14 @@ except NameError:
 
 BEHAVIOR_PKL = BASE_DIR / "outputs" / "matrices" / "behavioral_embeddings.pkl"
 ACTIVATION_PKL = BASE_DIR / "outputs" / "matrices" / "activation_embeddings.pkl"
-OUTPUT_CSV = BASE_DIR / "outputs" / "results" / "self_prediction_scores.csv"
+NORM_PATH = BASE_DIR / "data" / "psych_norms" / "psychnorms_subset_filtered_by_swow.csv"
+OUTPUT_CSV = BASE_DIR / "outputs" / "results" / "norm_prediction_scores.csv"
+SELF_OUTPUT_CSV = BASE_DIR / "outputs" / "results" / "self_prediction_scores.csv"
 MODEL_NORMS_DIR = BASE_DIR / "outputs" / "raw_behavior" / "model_norms"
 
 # =============================================================================
-# PARSING LOGIC
+# HELPER FUNCTIONS
 # =============================================================================
-
-def normalize_name(name):
-    """
-    Normalizes names to handle mismatches (e.g., '27-b' vs '27b').
-    Keeps 'instruct' vs 'base' distinct to prevent overwriting.
-    """
-    clean = name.lower().strip()
-    # Remove separators
-    clean = clean.replace("-", "").replace("_", "")
-    return clean
-
-def parse_model_family_and_type(key):
-    """
-    Decodes the dictionary key into:
-    1. Model Family (normalized name)
-    2. Embedding Type (e.g., 'Behavior_Contrastive_300d')
-    """
-    if key == "human_matrix": return "Human", "Baseline"
-    
-    # 1. Determine Broad Category & Clean Prefix
-    if key.startswith("activation_"):
-        category = "Activation"
-        clean = key.replace("activation_", "")
-    elif key.startswith("passive_"):
-        category = "Behavior"
-        clean = key.replace("passive_", "")
-    else:
-        return None, None
-
-    # 2. Extract Variants
-    is_300d = "_300d" in clean
-    is_contrast = "_contrast" in clean
-    is_shuffled = "_shuffled" in clean
-
-    # 3. Clean the Model Name (Remove suffixes to find the FAMILY)
-    stem = clean.replace("_300d", "").replace("_contrast", "").replace("_shuffled", "")
-    
-    # NOTE: We normalize dashes but KEEP 'instruct'/'base' if present 
-    # so we don't mix up different model versions.
-    stem = normalize_name(stem)
-
-    # 4. Construct Type Label
-    if category == "Activation":
-        final_type = "Activation"
-    else:
-        base = "Behavior"
-        if is_contrast:
-            variant = "Contrastive"
-        elif is_shuffled:
-            variant = "Shuffled"
-        else:
-            variant = "Standard"
-            
-        dim = "_300d" if is_300d else ""
-        final_type = f"{base}_{variant}{dim}"
-
-    return stem, final_type
 
 def load_pkl(path):
     if not path.exists():
@@ -110,26 +64,78 @@ def load_pkl(path):
     with open(path, 'rb') as f:
         return pickle.load(f)
 
+def load_norms():
+    paths_to_try = [
+        NORM_PATH,
+        BASE_DIR / "data" / "SWOW" / "utils" / "psychnorms_subset_filtered_by_swow.csv"
+    ]
+    for p in paths_to_try:
+        if p.exists():
+            print(f"Loading Norms from {p.name}...")
+            df = pd.read_csv(p, low_memory=False)
+            df['word'] = df['word'].astype(str).str.lower().str.strip()
+            df['human_rating'] = pd.to_numeric(df['human_rating'], errors='coerce')
+            return df.dropna(subset=['human_rating'])
+            
+    print(f"❌ CRITICAL: Norms not found.")
+    sys.exit(1)
+
 def load_model_norms(norm_dir: Path):
-    if not norm_dir.exists(): return {}
+    if not norm_dir.exists():
+        print(f"⚠️ Model norms dir missing: {norm_dir}")
+        return {}
     data = {}
     for fp in norm_dir.glob("*.csv"):
         try:
             df = pd.read_csv(fp, low_memory=False)
-            if 'cleaned_rating' not in df.columns: continue
+            if 'cleaned_rating' not in df.columns:
+                continue
             df['word'] = df['word'].astype(str).str.lower().str.strip()
             df['cleaned_rating'] = pd.to_numeric(df['cleaned_rating'], errors='coerce')
             df = df.dropna(subset=['cleaned_rating'])
-            
-            # Normalize key to match embedding keys
-            clean_name = normalize_name(fp.stem)
-            data[clean_name] = (fp.stem, df) 
-        except Exception: pass
+            data[fp.stem] = df
+        except Exception as e:
+            print(f"⚠️ Skip {fp.name}: {e}")
     print(f"Loaded {len(data)} model norm files.")
     return data
 
+def parse_embedding_key(key):
+    """Categorize embedding keys into types."""
+    if key == "human_matrix":
+        return "Human", "Baseline"
+    
+    if key.startswith("activation_"):
+        clean = key.replace("activation_", "").replace("-instruct", "")
+        return clean, "Activation"
+    
+    if key.startswith("passive_"):
+        clean = key.replace("passive_", "").replace("-instruct", "")
+        
+        # Check for 300d Suffix
+        suffix = ""
+        if "_300d" in clean:
+            clean = clean.replace("_300d", "")
+            suffix = "_300d"
+            
+        if "_contrast" in clean:
+            clean = clean.replace("_contrast", "")
+            etype = "Behavior_Contrastive" + suffix
+        elif "_shuffled" in clean:
+            clean = clean.replace("_shuffled", "")
+            etype = "Behavior_Shuffled" + suffix
+        else:
+            etype = "Behavior_Standard" + suffix
+            
+        return clean, etype
+            
+    return "Unknown", "Unknown"
+
 def evaluate_embedding(X, y, folds, jobs):
-    model = make_pipeline(StandardScaler(), RidgeCV(alphas=ALPHAS, scoring='r2'))
+    """Standardized Ridge Regression with Cross-Validation."""
+    model = make_pipeline(
+        StandardScaler(),
+        RidgeCV(alphas=ALPHAS, scoring='r2')
+    )
     cv = KFold(n_splits=folds, shuffle=True, random_state=42)
     scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=jobs)
     return scores.mean(), scores.std()
@@ -143,11 +149,95 @@ def _save_buffer(buffer, path):
             combined = pd.concat([old_df, new_df], ignore_index=True)
             combined = combined.drop_duplicates(subset=['Model', 'Embedding_Type', 'Norm'], keep='last')
             combined.to_csv(path, index=False)
-        except:
-            new_df.to_csv(path, index=False)
+        except Exception as e:
+            print(f"⚠️ CSV Error: {e}. Backup saved.")
+            new_df.to_csv(path.parent / f"backup_{int(time.time())}.csv", index=False)
     else:
         new_df.to_csv(path, index=False)
     print(f"  💾 Saved {len(buffer)} records to {path.name}")
+
+def run_self_predictions(embeddings_to_test, cue_to_idx, model_norms, out_csv):
+    """
+    Predict each model's OWN norms using its OWN embeddings.
+    """
+    if not model_norms:
+        print("⚠️ Self-prediction skipped: no model norms found.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"SELF-PREDICTION ROUTINE (Strict Overlap)")
+    print(f"   - Row Limit: {MAX_SAMPLES if MAX_SAMPLES else 'ALL (Unlimited)'}")
+    print(f"{'='*60}")
+
+    def to_canonical(name):
+        clean = name.lower().replace("-instruct", "").replace("-base", "")
+        return clean.replace("-", "").replace("_", "").strip()
+
+    norm_lookup = {}
+    print(f"[Self-Pred] 🔍 indexing {len(model_norms)} norm files...")
+    for stem, df in model_norms.items():
+        key = to_canonical(stem)
+        norm_lookup[key] = (stem, df)
+
+    total_samples_tracked = []
+
+    for item in embeddings_to_test:
+        model = item['model']
+        emb_type = item['type']
+        X_full = item['matrix']
+        
+        search_key = to_canonical(model)
+        match = norm_lookup.get(search_key)
+        
+        if match is None:
+            continue
+            
+        original_name, df = match
+        print(f"✅ PROC: {model:<30} | {emb_type:<25} | Matched: {original_name}")
+
+        rng = random.Random(search_key) 
+        model_buffer = [] 
+        
+        norm_col = 'norm' if 'norm' in df.columns else 'norm_name'
+        available_norms = sorted(df[norm_col].unique()) 
+
+        for norm_name in tqdm(available_norms, desc=f"     -> {emb_type[:15]}...", leave=False):
+            sub = df[df[norm_col] == norm_name]
+            words = sub['word'].astype(str).str.lower().str.strip()
+            overlap = sorted(list(set([w for w in words.unique() if w in cue_to_idx])))
+            
+            if len(overlap) < MIN_SAMPLES:
+                continue
+            
+            if MAX_SAMPLES and len(overlap) > MAX_SAMPLES:
+                overlap = rng.sample(overlap, MAX_SAMPLES)
+            
+            idxs = [cue_to_idx[w] for w in overlap]
+            y_map = sub.groupby('word')['cleaned_rating'].mean().to_dict()
+            y = np.array([y_map[w] for w in overlap])
+            X = X_full[idxs]
+            
+            r2, std = evaluate_embedding(X, y, CV_FOLDS, N_JOBS)
+            
+            model_buffer.append({
+                "Model": model,
+                "Embedding_Type": emb_type,
+                "Norm_File": original_name,
+                "Norm": norm_name,
+                "N_Samples": len(y),
+                "Dimensions": X_full.shape[1],
+                "R2_Mean": r2,
+                "R2_Std": std
+            })
+            total_samples_tracked.append(len(y))
+        
+        if model_buffer:
+            _save_buffer(model_buffer, out_csv)
+    
+    if total_samples_tracked:
+        avg_n = sum(total_samples_tracked) / len(total_samples_tracked)
+        print(f"\n📊 Self-Pred Stats: {len(total_samples_tracked)} regressions.")
+        print(f"   -> Average Words per Regression: {avg_n:.1f}")
 
 # =============================================================================
 # MAIN
@@ -155,180 +245,189 @@ def _save_buffer(buffer, path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--smoketest", action="store_true", help="Run verbose integrity check.")
-    parser.add_argument("--fast_mode", action="store_true", help="Enable strict introspection filtering.")
+    parser.add_argument("--smoketest", action="store_true", help="Run fast integrity check.")
     args = parser.parse_args()
 
-    # --- SETTINGS ---
-    if args.fast_mode:
-        print("\n🚀 FAST MODE: Strict Introspection Enabled")
-        REQUIRED_SAMPLES = 1000 
-        TARGET_NORM_COUNT = 5  # Sample 5 shared norms
-    else:
-        REQUIRED_SAMPLES = 1000
-        TARGET_NORM_COUNT = None # All shared norms
+    global CV_FOLDS, N_JOBS, MAX_SAMPLES
+    
+    # --- CONFIGURATION ---
+    MAX_SAMPLES = None
+    HUMAN_NORM_LIMIT = None 
 
     if args.smoketest:
-        print("\n🔥 SMOKETEST MODE ENABLED")
+        print("\n🔥 SMOKETEST MODE ENABLED 🔥")
         CV_FOLDS = 2
-        N_JOBS = 1
-        TARGET_NORM_COUNT = 1
-        REQUIRED_SAMPLES = 100 
-        out_csv = OUTPUT_CSV.parent / "self_prediction_scores_SMOKETEST.csv"
+        N_JOBS = 1 
+        HUMAN_NORM_LIMIT = 2
+        MAX_SAMPLES = 100
+        out_csv = OUTPUT_CSV.parent / "norm_prediction_scores_SMOKETEST.csv"
+        self_out_csv = SELF_OUTPUT_CSV.parent / "self_prediction_scores_SMOKETEST.csv"
     else:
-        CV_FOLDS = 5
-        N_JOBS = -1
+        print("\n🚀 FULL OVERLAP RUN ENABLED 🚀")
+        print("   - Strategy: Only process models with matching Activations")
+        print("   - Max Words: UNLIMITED")
         out_csv = OUTPUT_CSV
+        self_out_csv = SELF_OUTPUT_CSV
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-
+    
     # 1. Load Data
     behav_data = load_pkl(BEHAVIOR_PKL)
     act_data = load_pkl(ACTIVATION_PKL)
+    norm_df = load_norms()
     model_norms = load_model_norms(MODEL_NORMS_DIR)
+    
     cue_to_idx = behav_data['mappings']['cue_to_idx']
-
-    # 2. Group Embeddings by Model Family
-    print(f"\n{'='*60}")
-    print("🕵️‍♂️  INVENTORY CHECK")
-    print(f"{'='*60}")
-
-    model_groups = defaultdict(lambda: defaultdict(list))
-    all_sources = {**behav_data.get('embeddings', {}), **act_data.get('embeddings', {})}
-
-    for key, mat in all_sources.items():
-        family, etype = parse_model_family_and_type(key)
-        if family and family != "Human":
-            model_groups[family][etype] = mat
-
-    # 3. Validate Families
-    valid_families = []
+    norm_list = sorted(norm_df['norm_name'].unique()) 
     
-    print(f"{'Model Family':<25} | {'Act':<5} | {'Std':<5} | {'Cont':<5} | {'300d':<5} | {'Norms':<5} | Status")
-    print("-" * 85)
+    if HUMAN_NORM_LIMIT:
+        norm_list = norm_list[:HUMAN_NORM_LIMIT]
 
-    for family in sorted(model_groups.keys()):
-        types = model_groups[family].keys()
-        
-        has_act = "Activation" in types
-        has_std = any("Standard" in t for t in types)
-        has_cont = any("Contrastive" in t for t in types)
-        has_300 = any("300d" in t for t in types)
-        
-        # Check if norms exist for this family key (normalized)
-        has_norms = False
-        for norm_key in model_norms.keys():
-            if norm_key in family or family in norm_key: # Fuzzy match for safety
-                has_norms = True
-                break
-
-        # CRITERIA: Must have Activation AND (Standard OR Contrastive) AND Norms
-        is_valid = has_act and (has_std or has_cont) and has_norms
-        
-        status = "✅ Ready" if is_valid else "❌ Skip"
-        if is_valid: valid_families.append(family)
-
-        if args.smoketest or is_valid:
-            print(f"{family:<25} | {str(has_act)[0]:<5} | {str(has_std)[0]:<5} | {str(has_cont)[0]:<5} | {str(has_300)[0]:<5} | {str(has_norms)[0]:<5} | {status}")
-
-    print(f"\n🎯 Qualified Model Families: {len(valid_families)}")
-    if not valid_families:
-        print("❌ CRITICAL: No qualified model families found.")
-        sys.exit(1)
-
-    # 4. Global Norm Intersection (Constraint: Norms must exist for ALL valid families)
-    print(f"\n🔗 CALCULATING SHARED NORM INTERSECTION")
+    # --- STEP 2: BUILD VALID MODEL LIST (From Activations) ---
+    valid_models = set()
+    print("\n🔍 Scanning Activations for Valid Models...")
+    for key in act_data.get('embeddings', {}):
+        model_name, type_ = parse_embedding_key(key)
+        if type_ == "Activation":
+            valid_models.add(model_name)
     
-    family_valid_norms = {}
+    print(f"✅ Found {len(valid_models)} models with Activations: {sorted(list(valid_models))}")
+
+    # --- STEP 3: COLLECT & FILTER EMBEDDINGS ---
+    all_embeddings = []
     
-    for family in valid_families:
-        # Find the matching norm file
-        matched_key = next(k for k in model_norms.keys() if k in family or family in k)
-        original_name, df_norms = model_norms[matched_key]
-        
-        norm_col = 'norm' if 'norm' in df_norms.columns else 'norm_name'
-        
-        valid_set = set()
-        for n in df_norms[norm_col].unique():
-            sub = df_norms[df_norms[norm_col] == n]
-            words = sub['word'].astype(str).str.lower().str.strip()
-            overlap_count = sum(1 for w in words if w in cue_to_idx)
-            if overlap_count >= REQUIRED_SAMPLES:
-                valid_set.add(n)
-        family_valid_norms[family] = valid_set
+    WANTED_TYPES = {
+        "Baseline", "Activation", 
+        "Behavior_Contrastive", "Behavior_Standard",
+        "Behavior_Contrastive_300d", "Behavior_Standard_300d"
+    }
 
-    shared_norms = set.intersection(*family_valid_norms.values())
-    sorted_shared = sorted(list(shared_norms))
-    
-    print(f"✅ Shared Valid Norms: {len(sorted_shared)}")
-    if not sorted_shared:
-        print(f"❌ No norms meet the {REQUIRED_SAMPLES} word requirement across all models.")
-        print(f"   (Try reducing REQUIRED_SAMPLES if this is too strict)")
-        sys.exit(1)
-
-    # Select Targets
-    if TARGET_NORM_COUNT and len(sorted_shared) > TARGET_NORM_COUNT:
-        random.seed(42) 
-        target_norms = random.sample(sorted_shared, TARGET_NORM_COUNT)
-        print(f"🎯 Selected {TARGET_NORM_COUNT} Targets: {target_norms}")
-    else:
-        target_norms = sorted_shared
-
-    # 5. Execution Loop
-    print(f"\n🚀 STARTING BENCHMARK (Running only on Qualified Families)")
-    results_buffer = []
-
-    for family in valid_families:
-        print(f"\nModel Family: {family}")
-        
-        # Find norm file again
-        matched_key = next(k for k in model_norms.keys() if k in family or family in k)
-        original_norm_name, df_norms = model_norms[matched_key]
-        norm_col = 'norm' if 'norm' in df_norms.columns else 'norm_name'
-        
-        variants = sorted(model_groups[family].keys())
-        
-        for etype in variants:
-            if "Shuffled" in etype: continue 
+    def gather_embeddings(source_dict, is_behavioral=False):
+        skipped = 0
+        for key, mat in source_dict.items():
+            model, type_ = parse_embedding_key(key)
             
-            X_full = model_groups[family][etype]
+            if type_ not in WANTED_TYPES:
+                continue
+            
+            # FILTRATION LOGIC
+            # Always keep Human Baseline (for Task A reference)
+            # Always keep Activation (since that's our source of truth)
+            # Only filter Behavioral types
+            if is_behavioral and model != "Human":
+                if model not in valid_models:
+                    skipped += 1
+                    continue
+            
+            all_embeddings.append({"key": key, "matrix": mat, "model": model, "type": type_})
+        
+        return skipped
 
-            for norm_name in target_norms:
-                sub = df_norms[df_norms[norm_col] == norm_name]
-                words = sub['word'].astype(str).str.lower().str.strip()
-                overlap = sorted(list(set([w for w in words if w in cue_to_idx])))
+    print("\n📥 Gathering Embeddings...")
+    gather_embeddings(act_data.get('embeddings', {}), is_behavioral=False)
+    skipped_beh = gather_embeddings(behav_data.get('embeddings', {}), is_behavioral=True)
+    
+    all_embeddings.sort(key=lambda x: (x['model'], x['type']))
+
+    print(f"✅ Selected {len(all_embeddings)} Embedding Sources")
+    print(f"🚫 Filtered out {skipped_beh} behavioral sources (No matching activations)")
+    
+    # 4. Main Loop: Human Norm Prediction
+    results_buffer = []
+    total_human_samples = []
+    
+    # Resume Check
+    processed_configs = set()
+    if out_csv.exists() and not args.smoketest:
+        try:
+            df_exist = pd.read_csv(out_csv)
+            processed_configs = set(zip(df_exist['Model'], df_exist['Embedding_Type'], df_exist['Norm']))
+        except: pass
+
+    for item in all_embeddings:
+        model = item['model']
+        emb_type = item['type']
+        X_full = item['matrix']
+        max_rows = X_full.shape[0]
+        
+        norms_to_run = [n for n in norm_list if (model, emb_type, n) not in processed_configs]
+        
+        if not norms_to_run: continue
+        
+        print(f"\n{'='*60}")
+        print(f"Processing: {model} - {emb_type}")
+        print(f"  -> Remaining Norms: {len(norms_to_run)} / {len(norm_list)}")
+        print(f"{'='*60}")
+
+        clean_name = model.lower().replace("-instruct", "").replace("-base", "").replace("-", "").strip()
+        rng = random.Random(clean_name)
+        valid_map = {word: idx for word, idx in cue_to_idx.items() if idx < max_rows}
+
+        try:
+            for norm in tqdm(norms_to_run, desc=f"{model} [{emb_type}]"):
+                sub_df = norm_df[norm_df['norm_name'] == norm]
+                sub_df = sub_df[sub_df['word'].isin(valid_map.keys())]
+
+                if sub_df.empty: continue
+
+                norm_map = sub_df.set_index('word')['human_rating'].to_dict()
+                overlap = sorted(list(norm_map.keys())) 
                 
-                # Deterministic Sampling per (Family + Norm)
-                rng_norm = random.Random(f"{family}_{norm_name}_seed")
+                if len(overlap) < MIN_SAMPLES: continue
+
+                if MAX_SAMPLES and len(overlap) > MAX_SAMPLES:
+                    overlap = rng.sample(overlap, MAX_SAMPLES)
                 
-                if len(overlap) < REQUIRED_SAMPLES: continue
-                selected_words = rng_norm.sample(overlap, REQUIRED_SAMPLES)
+                idxs = [valid_map[w] for w in overlap]
+                y = np.array([norm_map[w] for w in overlap])
                 
-                idxs = [cue_to_idx[w] for w in selected_words]
-                y_map = sub.groupby('word')['cleaned_rating'].mean().to_dict()
-                y = np.array([y_map[w] for w in selected_words])
-                X = X_full[idxs]
+                X_sub = X_full[idxs]
+                if not np.isfinite(X_sub).all():
+                    mask = np.isfinite(X_sub).all(axis=1)
+                    X_sub = X_sub[mask]
+                    y = y[mask]
+                    if len(y) < MIN_SAMPLES: continue
                 
-                r2, std = evaluate_embedding(X, y, CV_FOLDS, N_JOBS)
+                r2, std = evaluate_embedding(X_sub, y, CV_FOLDS, N_JOBS)
                 
                 results_buffer.append({
-                    "Model": family, 
-                    "Embedding_Type": etype,
-                    "Norm_File": original_norm_name,
-                    "Norm": norm_name,
+                    "Model": model,
+                    "Embedding_Type": emb_type,
+                    "Norm": norm,
                     "N_Samples": len(y),
                     "Dimensions": X_full.shape[1],
                     "R2_Mean": r2,
                     "R2_Std": std
                 })
+                total_human_samples.append(len(y))
                 
-                if args.smoketest:
-                     print(f"   -> {etype:<25} | {norm_name} | R2: {r2:.3f}")
+                if len(results_buffer) >= 25:
+                    _save_buffer(results_buffer, out_csv)
+                    results_buffer = []
 
-        _save_buffer(results_buffer, out_csv)
-        results_buffer = [] 
+        except Exception as e:
+            print(f"\n❌ Error on {model} - {emb_type}: {e}")
+            continue
 
-    print(f"\n✅ Benchmark Complete. Results in: {out_csv}")
+    _save_buffer(results_buffer, out_csv)
+    
+    if total_human_samples:
+        avg_h = sum(total_human_samples) / len(total_human_samples)
+        print(f"\n📊 Human Task Stats: {len(total_human_samples)} regressions.")
+        print(f"   -> Average Words per Regression: {avg_h:.1f}")
+
+    print(f"\n✅ Human Norm prediction complete. Results: {out_csv}")
+
+    # 5. Secondary Loop: Self-Prediction
+    self_pred_items = [
+        a for a in all_embeddings 
+        if a['type'].startswith("Behavior") or a['type'] == "Activation"
+    ]
+    
+    if self_pred_items:
+        run_self_predictions(self_pred_items, cue_to_idx, model_norms, self_out_csv)
+    else:
+        print("⚠️ No suitable embeddings found for self-prediction.")
 
 if __name__ == "__main__":
     main()
