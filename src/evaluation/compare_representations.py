@@ -142,33 +142,51 @@ def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
         print("⚠️ Self-prediction skipped: no model norms found.")
         return
 
+    # --- FIX START ---
     # Build lookup from normalized stem -> dataframe
+    # We must explicitly strip "-instruct" because parse_embedding_key strips it from the model name
     norm_lookup = {}
     for stem, df in model_norms.items():
-        norm_lookup[normalize_model_name(stem)] = df
+        clean_key = normalize_model_name(stem).replace("-instruct", "")
+        norm_lookup[clean_key] = df
+    # --- FIX END ---
 
     rows = []
+    
+    # Debug print to ensure keys are matching now
+    print(f"[Self-Pred] Lookup Keys Available: {list(norm_lookup.keys())}")
+
     for item in behavior_items:
         model = item['model']
         emb_type = item['type']
         key = item['key']
         X_full = item['matrix']
-        norm_key = normalize_model_name(model)
+        
+        # Ensure the model key matches the lookup key format
+        norm_key = normalize_model_name(model).replace("-instruct", "")
+        
         df = norm_lookup.get(norm_key)
+        
         if df is None:
+            # Optional: Print what failed to match to help debug
+            # print(f"  [Skip] No norms found for {model} (Looked for: {norm_key})")
             continue
 
         norm_col = 'norm' if 'norm' in df.columns else 'norm_name'
         for norm_name, sub in df.groupby(norm_col):
             words = sub['word'].astype(str).str.lower().str.strip()
             overlap = [w for w in words.unique() if w in cue_to_idx]
+            
             if len(overlap) < MIN_SAMPLES:
                 continue
+            
             idxs = [cue_to_idx[w] for w in overlap]
             y_map = sub.groupby('word')['cleaned_rating'].mean().to_dict()
             y = np.array([y_map[w] for w in overlap])
             X = X_full[idxs]
+            
             r2, std = evaluate_embedding(X, y, CV_FOLDS, N_JOBS)
+            
             rows.append({
                 "Model": model,
                 "Embedding_Type": emb_type,
