@@ -37,8 +37,8 @@ def main():
     parser.add_argument("--skip-activations", action="store_true", help="Skip vectorizing activations.")
     parser.add_argument("--skip-behavior", action="store_true", help="Skip vectorizing behavior.")
     parser.add_argument("--skip-compare", action="store_true", help="Skip comparison step.")
-    parser.add_argument("--behavior-full-mode", action="store_true",
-                        help="Pass --full_mode to behavior vectorization.")
+    parser.add_argument("--behavior-limited-mode", action="store_true",
+                        help="Limit behavior vectorization to core models.")
     parser.add_argument("--behavior-dim-strategy", choices=["activation", "mapping", "fixed"], default="activation",
                         help="Dimension selection for behavior vectorization.")
     parser.add_argument("--behavior-activation-pkl", type=Path, default=default_activation_pkl,
@@ -72,8 +72,8 @@ def main():
         ]
         if args.behavior_dim_strategy == "activation":
             behavior_cmd += ["--activation_pkl", str(args.behavior_activation_pkl)]
-        if args.behavior_full_mode:
-            behavior_cmd.append("--full_mode")
+        if args.behavior_limited_mode:
+            behavior_cmd.append("--limited_mode")
         run_step("Vectorizing Behavior", behavior_cmd)
 
     # 3) Comparison

@@ -5,7 +5,7 @@ The "Feature Factory" for Behavioral Representations.
 Constructs Semantic Matrices aligned with the "Contrastive" methodology.
 
 FEATURES:
-- Matches SVD dimensions to specific Model Hidden States.
+- Matches SVD dimensions to specific Model Hidden States (and also exports fixed 300d variants).
 - Generates 'human_matrix' embedding (Baseline).
 - Auto-switches to Randomized SVD for high-dimensions (Speed Fix).
 - Dimension strategy options:
@@ -467,14 +467,14 @@ def main():
     default_swow, default_passive, default_deranged, default_active, default_out = infer_default_paths()
     default_activation_pkl = default_out / "activation_embeddings.pkl"
 
-    parser = argparse.ArgumentParser(description="Build Behavioral Vectors (Matched Dims + Human).")
+    parser = argparse.ArgumentParser(description="Build Behavioral Vectors (Matched Dims + 300d variants + Human).")
     parser.add_argument('--swow_path', type=Path, default=default_swow)
     parser.add_argument('--passive_dir', type=Path, default=default_passive)
     parser.add_argument('--deranged_dir', type=Path, default=default_deranged)
     parser.add_argument('--active_dir', type=Path, default=default_active)
     parser.add_argument('--output_dir', type=Path, default=default_out)
-    parser.add_argument('--full_mode', action='store_true',
-                        help="Process all models (disables limited mode).")
+    parser.add_argument('--limited_mode', action='store_true',
+                        help="Process only the core set of models.")
     parser.add_argument('--dim_strategy', choices=['activation', 'mapping', 'fixed'], default='activation',
                         help="activation: match dims from activation_embeddings.pkl; "
                              "mapping: use MODEL_TARGET_DIMS; fixed: use --fixed_dim.")
@@ -486,9 +486,9 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
-    allowed_models = None if args.full_mode else LIMITED_MODE_MODELS
+    allowed_models = LIMITED_MODE_MODELS if args.limited_mode else None
     if allowed_models is not None:
-        print("[Mode] Limited mode enabled by default. Only processing human plus core models.")
+        print("[Mode] Limited mode enabled. Only processing human plus core models.")
     else:
         print("[Mode] Full mode enabled. Processing all available models.")
 
@@ -526,14 +526,21 @@ def main():
 
     # 3. Transform
     print("\n[Transformation] Applying PPMI + SVD...")
-    dense_results = derive_dense_embeddings(matrices, dim_lookup, args.dim_strategy, args.fixed_dim)
+    # Matched-to-activation embeddings
+    dense_matched = derive_dense_embeddings(matrices, dim_lookup, "activation", args.fixed_dim)
+    # Fixed 300d embeddings (for behavioral comparisons)
+    dense_fixed = derive_dense_embeddings(matrices, {}, "fixed", 300)
+    dense_fixed = {k if k == 'human_matrix' else f"{k}_300d": v for k, v in dense_fixed.items()}
     
-    # 4. Sanitize
-    dense_results, mappings = align_and_sanitize_rows(dense_results, mappings)
+    # Merge and sanitize
+    merged = {}
+    merged.update(dense_matched)
+    merged.update(dense_fixed)
     
-    # 5. Export
+    merged, mappings = align_and_sanitize_rows(merged, mappings)
+    
     export_payload = {
-        'embeddings': dense_results,
+        'embeddings': merged,
         'mappings': mappings
     }
     
@@ -541,7 +548,7 @@ def main():
     with open(out_path, 'wb') as f:
         pickle.dump(export_payload, f)
         
-    print(f"\n[Success] Saved {len(dense_results)} aligned matrices to {out_path}")
+    print(f"\n[Success] Saved {len(merged)} aligned matrices to {out_path}")
 
 if __name__ == "__main__":
     main()

@@ -17,6 +17,7 @@ from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import KFold, cross_val_score
+from collections import defaultdict
 
 # --- CONFIGURATION ---
 MIN_SAMPLES = 50 
@@ -34,6 +35,8 @@ BEHAVIOR_PKL = BASE_DIR / "outputs" / "matrices" / "behavioral_embeddings.pkl"
 ACTIVATION_PKL = BASE_DIR / "outputs" / "matrices" / "activation_embeddings.pkl"
 NORM_PATH = BASE_DIR / "data" / "psych_norms" / "psychnorms_subset_filtered_by_swow.csv"
 OUTPUT_CSV = BASE_DIR / "outputs" / "results" / "norm_prediction_scores.csv"
+SELF_OUTPUT_CSV = BASE_DIR / "outputs" / "results" / "self_prediction_scores.csv"
+MODEL_NORMS_DIR = BASE_DIR / "outputs" / "raw_behavior" / "model_norms"
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -63,6 +66,35 @@ def load_norms():
     print(f"❌ CRITICAL: Norms not found.")
     sys.exit(1)
 
+def load_model_norms(norm_dir: Path):
+    if not norm_dir.exists():
+        print(f"⚠️ Model norms dir missing: {norm_dir}")
+        return {}
+    data = {}
+    for fp in norm_dir.glob("*.csv"):
+        try:
+            df = pd.read_csv(fp, low_memory=False)
+            if 'cleaned_rating' not in df.columns:
+                continue
+            df['word'] = df['word'].astype(str).str.lower().str.strip()
+            df['cleaned_rating'] = pd.to_numeric(df['cleaned_rating'], errors='coerce')
+            df = df.dropna(subset=['cleaned_rating'])
+            data[fp.stem] = df
+        except Exception as e:
+            print(f"⚠️ Skip {fp.name}: {e}")
+    print(f"Loaded {len(data)} model norm files.")
+    return data
+
+def normalize_model_name(raw: str) -> str:
+    import re
+    name = raw.strip().lower().replace(' ', '-').replace('_', '-')
+    name = re.sub(r'(?<=[a-z])(?=\d)', '-', name)
+    name = re.sub(r'(?<=\d)(?=[a-z])', '-', name)
+    while '--' in name:
+        name = name.replace('--', '-')
+    name = name.replace('-b-', 'b-')
+    return name
+
 def parse_embedding_key(key):
     if key == "human_matrix":
         return "Human", "Baseline"
@@ -73,12 +105,19 @@ def parse_embedding_key(key):
     
     if key.startswith("passive_"):
         clean = key.replace("passive_", "").replace("-instruct", "")
+        suffix = None
+        if clean.endswith("_300d"):
+            clean = clean.replace("_300d", "")
+            suffix = "_300d"
         if "_contrast" in clean:
-            return clean.replace("_contrast", ""), "Behavior_Contrastive"
+            clean = clean.replace("_contrast", "")
+            etype = "Behavior_Contrastive" + (suffix or "")
         elif "_shuffled" in clean:
-            return clean.replace("_shuffled", ""), "Behavior_Shuffled"
+            clean = clean.replace("_shuffled", "")
+            etype = "Behavior_Shuffled" + (suffix or "")
         else:
-            return clean, "Behavior_Standard"
+            etype = "Behavior_Standard" + (suffix or "")
+        return clean, etype
             
     return "Unknown", "Unknown"
 
@@ -96,6 +135,56 @@ def evaluate_embedding(X, y, folds, jobs):
     # Run the CV in parallel
     scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=jobs)
     return scores.mean(), scores.std()
+
+def run_self_predictions(behavior_items, cue_to_idx, model_norms, out_csv):
+    """Predict each model's own norms for behavioral embeddings."""
+    if not model_norms:
+        print("⚠️ Self-prediction skipped: no model norms found.")
+        return
+
+    # Build lookup from normalized stem -> dataframe
+    norm_lookup = {}
+    for stem, df in model_norms.items():
+        norm_lookup[normalize_model_name(stem)] = df
+
+    rows = []
+    for item in behavior_items:
+        model = item['model']
+        emb_type = item['type']
+        key = item['key']
+        X_full = item['matrix']
+        norm_key = normalize_model_name(model)
+        df = norm_lookup.get(norm_key)
+        if df is None:
+            continue
+
+        norm_col = 'norm' if 'norm' in df.columns else 'norm_name'
+        for norm_name, sub in df.groupby(norm_col):
+            words = sub['word'].astype(str).str.lower().str.strip()
+            overlap = [w for w in words.unique() if w in cue_to_idx]
+            if len(overlap) < MIN_SAMPLES:
+                continue
+            idxs = [cue_to_idx[w] for w in overlap]
+            y_map = sub.groupby('word')['cleaned_rating'].mean().to_dict()
+            y = np.array([y_map[w] for w in overlap])
+            X = X_full[idxs]
+            r2, std = evaluate_embedding(X, y, CV_FOLDS, N_JOBS)
+            rows.append({
+                "Model": model,
+                "Embedding_Type": emb_type,
+                "Norm_File": norm_key,
+                "Norm": norm_name,
+                "N_Samples": len(y),
+                "Dimensions": X_full.shape[1],
+                "R2_Mean": r2,
+                "R2_Std": std
+            })
+
+    if rows:
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+        print(f"  💾 Saved {len(rows)} self-prediction records to {out_csv.name}")
+    else:
+        print("⚠️ Self-prediction produced no records (insufficient overlap or missing norms).")
 
 def _save_buffer(buffer, path):
     if not buffer: return
@@ -141,6 +230,7 @@ def main():
     behav_data = load_pkl(BEHAVIOR_PKL)
     act_data = load_pkl(ACTIVATION_PKL)
     norm_df = load_norms()
+    model_norms = load_model_norms(MODEL_NORMS_DIR)
     
     cue_to_idx = behav_data['mappings']['cue_to_idx']
     norm_list = norm_df['norm_name'].unique()
@@ -155,7 +245,9 @@ def main():
         "Baseline", 
         "Activation", 
         "Behavior_Contrastive", 
-        "Behavior_Standard"
+        "Behavior_Standard",
+        "Behavior_Contrastive_300d", 
+        "Behavior_Standard_300d"
     }
     
     for key, mat in behav_data['embeddings'].items():
@@ -182,6 +274,7 @@ def main():
         except: pass
 
     results_buffer = []
+    behavior_items = [a for a in all_embeddings if a['type'].startswith("Behavior")]
 
     # 3. Main Loop
     for item in all_embeddings:
@@ -259,7 +352,15 @@ def main():
             continue
 
     _save_buffer(results_buffer, out_csv)
-    print(f"\n✅ Pipeline Complete. Results: {out_csv}")
+    print(f"\n✅ Norm prediction complete. Results: {out_csv}")
+
+    # Self-prediction (behavioral embeddings only)
+    if behavior_items:
+        self_out = SELF_OUTPUT_CSV
+        self_out.parent.mkdir(parents=True, exist_ok=True)
+        run_self_predictions(behavior_items, cue_to_idx, model_norms, self_out)
+    else:
+        print("⚠️ No behavioral embeddings found for self-prediction.")
 
 if __name__ == "__main__":
     main()
