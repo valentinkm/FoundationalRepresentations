@@ -2,13 +2,13 @@
 src/evaluation/compare_representations.py
 
 Batched Ridge Regression Evaluation.
-Task A: Alignment (Predicting Human Norms) -> FAST MODE: Sample 20 Global Targets from 288.
-Task B: Introspection (Predicting Model's Own Norms) -> FAST MODE: Keep ALL (~15) Norms per model.
+Task A: Alignment (Predicting Human Norms) -> FAST MODE: Sample 20 Global Targets.
+Task B: Introspection (Predicting Model's Own Norms) -> FAST MODE: Keep ALL Norms (~15) but subsample rows.
 
 UPDATES:
-- FAST MODE: Row subsampling is DISABLED (uses full vocabulary overlap) to maximize R^2 accuracy.
-- FAST MODE: Only restricts the number of Human Norm targets (20).
-- Ensures 300d embeddings are processed if present in the pickle.
+- FAST MODE: Row subsampling ENABLED (Max 1000 words).
+- FAST MODE: Human Norm targets restricted to 20.
+- Ensures 300d embeddings are processed.
 """
 
 import pandas as pd
@@ -164,7 +164,7 @@ def run_self_predictions(embeddings_to_test, cue_to_idx, model_norms, out_csv, m
     print(f"\n{'='*60}")
     print(f"SELF-PREDICTION ROUTINE")
     if max_samples:
-        print(f"   - Row Limit: {max_samples}")
+        print(f"   - Row Limit: {max_samples} (Subsampled)")
     else:
         print(f"   - Row Limit: None (Full Overlap)")
     print(f"{'='*60}")
@@ -247,22 +247,22 @@ def run_self_predictions(embeddings_to_test, cue_to_idx, model_norms, out_csv, m
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoketest", action="store_true", help="Run fast integrity check.")
-    parser.add_argument("--fast_mode", action="store_true", help="Limit Norm targets, but keep full row count.")
+    parser.add_argument("--fast_mode", action="store_true", help="Limit rows and norm targets for speed.")
     args = parser.parse_args()
 
     global CV_FOLDS, N_JOBS
     
     # --- CONFIGURATION LOGIC ---
     
-    # ROW LIMITS:
-    # User requested to "bump up predictive performance". 
-    # Therefore, we remove row limits (None) to use all available data, 
-    # even in fast mode.
-    MAX_SAMPLES = None 
-    
-    # NORM LIMITS (Task A - Human):
-    # Fast mode restricts global targets to 20 to save time.
-    HUMAN_NORM_LIMIT = 20 if args.fast_mode else None
+    if args.fast_mode:
+        MAX_SAMPLES = 1000  # <--- LIMIT RESTORED FOR SPEED
+        HUMAN_NORM_LIMIT = 20
+        print(f"\n🚀 FAST MODE ENABLED")
+        print(f"   - Max Words per Norm: {MAX_SAMPLES}")
+        print(f"   - Human Norm Targets: {HUMAN_NORM_LIMIT}")
+    else:
+        MAX_SAMPLES = None
+        HUMAN_NORM_LIMIT = None
 
     # SMOKETEST OVERRIDES
     if args.smoketest:
@@ -292,8 +292,6 @@ def main():
     if HUMAN_NORM_LIMIT:
         random.seed(42) # Fixed Seed for Norm Selection
         norm_list = random.sample(norm_list, HUMAN_NORM_LIMIT)
-        print(f"\n🚀 FAST MODE: Restricted to {len(norm_list)} Human Norms.")
-        print(f"   (Row subsampling is DISABLED to maximize R^2 scores)")
 
     # 2. Collect Embeddings
     all_embeddings = []
@@ -305,7 +303,6 @@ def main():
         "Behavior_Contrastive_300d", "Behavior_Standard_300d"
     }
     
-    # Helper to gather
     def gather_embeddings(source_dict):
         for key, mat in source_dict.items():
             model, type_ = parse_embedding_key(key)
@@ -321,15 +318,12 @@ def main():
     print(f"\n✅ Found {len(all_embeddings)} Target Embedding Sources")
     type_counts = Counter([x['type'] for x in all_embeddings])
     print("   Breakdown:", dict(type_counts))
-    if "Behavior_Standard_300d" not in type_counts:
-        print("⚠️  WARNING: No 'Behavior_Standard_300d' found. Check input pickle file.")
 
     # 3. Resume Check (Human Norms)
     processed_configs = set()
     if out_csv.exists() and not args.smoketest:
         try:
             df_exist = pd.read_csv(out_csv)
-            # Create a set of (Model, Type, Norm) tuples
             processed_configs = set(zip(df_exist['Model'], df_exist['Embedding_Type'], df_exist['Norm']))
         except: pass
 
@@ -342,14 +336,12 @@ def main():
         X_full = item['matrix']
         max_rows = X_full.shape[0]
         
-        # Filter norms that are already done
         norms_to_run = [n for n in norm_list if (model, emb_type, n) not in processed_configs]
         
         if not norms_to_run: continue
         
         print(f"\n{'='*60}")
         print(f"Processing: {model} - {emb_type}")
-        print(f"  -> Shape: {X_full.shape}")
         print(f"  -> Remaining Norms: {len(norms_to_run)} / {len(norm_list)}")
         print(f"{'='*60}")
 
@@ -370,7 +362,7 @@ def main():
                 
                 if len(overlap) < MIN_SAMPLES: continue
 
-                # ROW SAMPLING: Only apply if MAX_SAMPLES is set (it is None in Fast Mode now)
+                # ROW SAMPLING: Applied if MAX_SAMPLES is set
                 if MAX_SAMPLES and len(overlap) > MAX_SAMPLES:
                     overlap = rng.sample(overlap, MAX_SAMPLES)
                 
@@ -378,7 +370,6 @@ def main():
                 y = np.array([norm_map[w] for w in overlap])
                 
                 X_sub = X_full[idxs]
-                # Safety check for NaNs in embeddings
                 if not np.isfinite(X_sub).all():
                     mask = np.isfinite(X_sub).all(axis=1)
                     X_sub = X_sub[mask]
@@ -409,15 +400,13 @@ def main():
     print(f"\n✅ Human Norm prediction complete. Results: {out_csv}")
 
     # 5. Secondary Loop: Self-Prediction
-    # Filter out "Baseline" because humans don't have model norm files
-    # Note: 300d types start with "Behavior", so they are included here.
     self_pred_items = [
         a for a in all_embeddings 
         if a['type'].startswith("Behavior") or a['type'] == "Activation"
     ]
     
     if self_pred_items:
-        # Pass MAX_SAMPLES (which is None in fast mode) to ensure full accuracy
+        # Pass MAX_SAMPLES to enforce the row limit
         run_self_predictions(self_pred_items, cue_to_idx, model_norms, self_out_csv, max_samples=MAX_SAMPLES)
     else:
         print("⚠️ No suitable embeddings found for self-prediction.")
