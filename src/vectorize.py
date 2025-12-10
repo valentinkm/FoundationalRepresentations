@@ -301,11 +301,17 @@ def _process_single_activation(fp: Path, cue_to_idx: dict, allowed_models: list 
                     matrix[idx] = vec
                     hit_count += 1
         
+        # Sanity Checks
+        non_zeros = matrix[matrix != 0]
+        if len(non_zeros) == 0:
+            print(f"    [Warning] {key}: Matrix is ALL ZEROS.")
+        elif np.isnan(matrix).any():
+            print(f"    [Warning] {key}: Matrix contains NaNs.")
+            matrix = np.nan_to_num(matrix)
+        
         print(f"    > Processed {key}: {hit_count}/{n_cues} coverage, {dim} dims.")
-        if verbose and hit_count > 0:
-             non_zeros = matrix[matrix != 0]
-             if len(non_zeros) > 0:
-                 print(f"    > Stats: Mean={non_zeros.mean():.4f}, Std={non_zeros.std():.4f}, Min={non_zeros.min():.4f}, Max={non_zeros.max():.4f}")
+        if verbose and len(non_zeros) > 0:
+             print(f"    > Stats: Mean={non_zeros.mean():.4f}, Std={non_zeros.std():.4f}, Min={non_zeros.min():.4f}, Max={non_zeros.max():.4f}")
         
         return key, matrix
         
@@ -391,6 +397,10 @@ def _process_single_transform(key: str, mat: csr_matrix, n_components: int, verb
     if verbose:
         print(f"    > Final Shape: {embeddings.shape}")
         print(f"    > Sample Vector (first 5 dims of first row): {embeddings[0, :5]}")
+        # Stats
+        non_zeros = embeddings[embeddings != 0]
+        if len(non_zeros) > 0:
+             print(f"    > Stats: Mean={non_zeros.mean():.4f}, Std={non_zeros.std():.4f}, Min={non_zeros.min():.4f}, Max={non_zeros.max():.4f}")
         
     return key, embeddings
 

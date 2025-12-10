@@ -125,6 +125,24 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
     rating_map = sub_df.groupby('word')['cleaned_rating'].mean().to_dict()
     y = np.array([rating_map[w] for w in overlap])
     
+    # Sanity Checks
+    if verbose:
+        y_std = np.std(y)
+        if y_std < 1e-6:
+            print(f"    [Warning] Target 'y' is constant (Std={y_std:.6f}). R^2 will be 0.0 or negative.")
+        
+        # Check X variance
+        # If sparse, convert to dense for check (careful with memory, but overlap is small ~10k)
+        if hasattr(X, "toarray"):
+            X_dense = X.toarray()
+        else:
+            X_dense = X
+            
+        x_std = np.std(X_dense, axis=0)
+        dead_cols = np.sum(x_std < 1e-6)
+        if dead_cols > 0:
+            print(f"    [Warning] X has {dead_cols}/{X.shape[1]} zero-variance columns.")
+
     return X, y, overlap
 
 def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
