@@ -84,7 +84,7 @@ def load_human_swow(human_csv_path: Path, min_freq: int) -> tuple[pd.DataFrame, 
     return df_filtered, mappings, valid_words
 
 
-def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set) -> dict:
+def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None) -> dict:
     """
     Ingest 'Passive' CSVs (Logprobs).
     Logic: LogProb -> Exp -> Normalize -> Sparse Matrix.
@@ -107,6 +107,12 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set) ->
         # Skip deranged files if they are mixed in (optional check)
         if "deranged" in model_name: 
             continue
+
+        # Filter by allowed_models if set
+        if allowed_models:
+            if not any(m in model_name for m in allowed_models):
+                continue
+
             
         try:
             df = pd.read_csv(fp)
@@ -157,7 +163,7 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set) ->
     return matrices
 
 
-def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set) -> dict:
+def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None) -> dict:
     """
     Ingest 'Active' JSONLs (Generated Text).
     Logic: Raw Text -> Count -> Normalize -> Sparse Matrix.
@@ -177,6 +183,12 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set) -
 
     for fp in files:
         model_name = fp.stem
+        
+        # Filter by allowed_models if set
+        if allowed_models:
+            if not any(m in model_name for m in allowed_models):
+                continue
+                
         data_rows = []
         
         try:
@@ -228,7 +240,7 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set) -
 # ACTIVATIONS (Raw Dense Vectors)
 # =============================================================================
 
-def process_activations(input_dir: Path, mappings: dict) -> dict:
+def process_activations(input_dir: Path, mappings: dict, allowed_models: list = None) -> dict:
     """
     Ingest 'Activation' CSVs (Raw Dense Vectors).
     Logic: Raw Vector -> Align to Cue Index -> Dense Matrix.
@@ -250,6 +262,12 @@ def process_activations(input_dir: Path, mappings: dict) -> dict:
     
     for fp in files:
         model_name = fp.stem
+        
+        # Filter by allowed_models if set
+        if allowed_models:
+            if not any(m in model_name for m in allowed_models):
+                continue
+                
         # Clean up common suffixes if present
         clean_name = model_name.replace('_embeddings', '')
         key = f"activation_{clean_name}"
@@ -392,6 +410,7 @@ def main():
     parser.add_argument('--activation_dir', type=Path, required=False, help="Dir containing Activation CSVs")
     parser.add_argument('--output_dir', type=Path, required=True, help="Dir to save output pickle")
     parser.add_argument('--n_components', type=int, default=300, help="SVD Dimensions")
+    parser.add_argument('--models', nargs='*', help="List of model names to process (substring match)")
     args = parser.parse_args()
 
     # 1. Setup
@@ -412,16 +431,15 @@ def main():
     matrices = {'human_matrix': human_mat}
     
     # Passive
-    matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set))
+    matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models))
     
     # Active
-    # Active
-    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set))
+    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set, allowed_models=args.models))
     
     # Activations (Raw) - These bypass PPMI/SVD
     activation_matrices = {}
     if args.activation_dir:
-        activation_matrices = process_activations(args.activation_dir, mappings)
+        activation_matrices = process_activations(args.activation_dir, mappings, allowed_models=args.models)
     else:
         print("[Activations] No directory provided, skipping.")
     

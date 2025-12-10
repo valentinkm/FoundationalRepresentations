@@ -116,7 +116,7 @@ def evaluate_embedding(X, y, random_state=42):
         print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
-def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path):
+def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowed_models=None):
     """Main loop over Embeddings x Norms."""
     results = []
     
@@ -127,6 +127,19 @@ def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path):
     # 2. Identify all embeddings
     # Filter out metadata keys if any persist
     emb_keys = [k for k in embeddings_dict.keys() if k != 'mappings']
+    
+    # Filter by allowed_models if set
+    if allowed_models:
+        # Always include 'human' if it exists, or maybe strictly follow user?
+        # Let's strictly follow user, but if they want human they must say it.
+        # BUT, usually we want to compare against human.
+        # Let's assume strict filtering.
+        filtered_keys = []
+        for k in emb_keys:
+            if any(m in k for m in allowed_models):
+                filtered_keys.append(k)
+        emb_keys = filtered_keys
+        
     print(f"[Judge] Found {len(emb_keys)} embedding sources.")
     
     cue_to_idx = mappings['cue_to_idx']
@@ -179,6 +192,7 @@ def main():
     parser.add_argument('--embeddings_path', type=Path, required=True, help="Pickle from vectorize.py")
     parser.add_argument('--norms_path', type=Path, required=True, help="Path to psychNorms.csv")
     parser.add_argument('--output_dir', type=Path, required=True, help="Where to save results.csv")
+    parser.add_argument('--models', nargs='*', help="List of model names to evaluate (substring match)")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -189,7 +203,7 @@ def main():
     
     # Run Eval
     output_csv = args.output_dir / "evaluation_results.csv"
-    run_evaluation_loop(embeddings, mappings, norms_df, output_csv)
+    run_evaluation_loop(embeddings, mappings, norms_df, output_csv, allowed_models=args.models)
 
 if __name__ == "__main__":
     import sys
