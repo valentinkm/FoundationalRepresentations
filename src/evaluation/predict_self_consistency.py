@@ -125,6 +125,25 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
     rating_map = sub_df.groupby('word')['cleaned_rating'].mean().to_dict()
     y = np.array([rating_map[w] for w in overlap])
     
+    # STRICT FILTERING: Remove Zero Vectors
+    if hasattr(X, "toarray"):
+        norms = np.linalg.norm(X.toarray(), axis=1)
+    else:
+        norms = np.linalg.norm(X, axis=1)
+        
+    valid_mask = norms > 0
+    if not valid_mask.all():
+        dropped_zeros = np.sum(~valid_mask)
+        if verbose:
+            print(f"    > Dropped {dropped_zeros} rows due to Zero Vectors (Ghost Matches).")
+        
+        X = X[valid_mask]
+        y = y[valid_mask]
+        overlap = [w for i, w in enumerate(overlap) if valid_mask[i]]
+        
+    if len(X) < MIN_SAMPLES:
+        return None, None, None
+    
     # Sanity Checks
     if verbose:
         y_std = np.std(y)
