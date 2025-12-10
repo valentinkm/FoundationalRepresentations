@@ -129,6 +129,9 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
 
 def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
     """Run Ridge Regression with Nested CV."""
+    # Sanitize X
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
     model = make_pipeline(
         StandardScaler(),
         RidgeCV(alphas=DEFAULT_ALPHAS, scoring='r2')
@@ -143,7 +146,8 @@ def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
             print(f"    > Best Alpha: {best_alpha}")
         return scores.mean(), scores.std()
     except Exception as e:
-        print(f"    [Error] Regression failed: {e}")
+        if verbose:
+            print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
 def _evaluate_single_norm(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose):

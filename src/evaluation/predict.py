@@ -115,30 +115,27 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
     return X, y, overlap
 
 def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
-    """
-    Run Ridge Regression with Nested CV.
-    Inner CV: Select Alpha.
-    Outer CV: Evaluate R^2.
-    """
-    # Pipeline: Scale features -> Ridge
-    # We use RidgeCV which handles the inner loop for Alpha selection efficiently
+    """Run Ridge Regression with Nested CV."""
+    # Sanitize X to prevent SVD failures
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    
     model = make_pipeline(
         StandardScaler(),
         RidgeCV(alphas=DEFAULT_ALPHAS, scoring='r2')
     )
     
-    # Outer Cross-Validation for robust R^2 estimation
     cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=random_state)
     try:
         scores = cross_val_score(model, X, y, cv=cv, scoring='r2')
-        # Optional: Fit on full data to see best alpha (just for logging)
         if verbose:
             model.fit(X, y)
             best_alpha = model.named_steps['ridgecv'].alpha_
             print(f"    > Best Alpha: {best_alpha}")
         return scores.mean(), scores.std()
     except Exception as e:
-        print(f"    [Error] Regression failed: {e}")
+        # Catch LinAlgError (SVD did not converge) and others
+        if verbose:
+            print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
 def _evaluate_single_norm(emb_name, X_full, cue_to_idx, norms_df, norm, verbose):
