@@ -79,6 +79,17 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name):
     available_words = set(sub_df['word'].unique())
     overlap = list(valid_cues.intersection(available_words))
     
+    # Logging
+    norm_vocab_size = len(available_words)
+    overlap_pct = len(overlap) / norm_vocab_size if norm_vocab_size > 0 else 0
+    print(f"    > Overlap: {len(overlap)}/{norm_vocab_size} ({overlap_pct:.1%})")
+    
+    if len(overlap) > 0:
+        print(f"    > Sample Overlap: {overlap[:5]}")
+        missing = list(available_words - valid_cues)
+        if missing:
+            print(f"    > Sample Missing: {missing[:5]}")
+    
     if len(overlap) < MIN_SAMPLES:
         return None, None, None
         
@@ -111,6 +122,10 @@ def evaluate_embedding(X, y, random_state=42):
     cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=random_state)
     try:
         scores = cross_val_score(model, X, y, cv=cv, scoring='r2')
+        # Optional: Fit on full data to see best alpha (just for logging)
+        model.fit(X, y)
+        best_alpha = model.named_steps['ridgecv'].alpha_
+        print(f"    > Best Alpha: {best_alpha}")
         return scores.mean(), scores.std()
     except Exception as e:
         print(f"    [Error] Regression failed: {e}")

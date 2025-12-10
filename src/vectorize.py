@@ -81,6 +81,8 @@ def load_human_swow(human_csv_path: Path, min_freq: int) -> tuple[pd.DataFrame, 
     }
     
     print(f"[Vocab] Defined Space: {len(all_cues)} Cues x {len(all_responses)} Responses.")
+    print(f"  > Sample Cues: {all_cues[:5]}")
+    print(f"  > Sample Responses: {all_responses[:5]}")
     return df_filtered, mappings, valid_words
 
 
@@ -128,12 +130,18 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, al
             df['response_set'] = df['response_set'].astype(str).str.strip()
             
             # Filter to Canon Vocab
+            initial_rows = len(df)
             mask = (df['cue'].isin(cue_to_idx)) & (df['response_set'].isin(vocab_set))
             df = df[mask].copy()
+            dropped = initial_rows - len(df)
             
             if df.empty:
-                print(f"[Passive] {model_name}: No overlap with human vocab.")
+                print(f"[Passive] {model_name}: No overlap with human vocab. (Dropped {dropped}/{initial_rows} rows)")
                 continue
+            
+            print(f"  > {model_name}: Kept {len(df)}/{initial_rows} rows ({len(df)/initial_rows:.1%}). Dropped {dropped}.")
+            if len(df) > 0:
+                print(f"  > Sample Logprobs:\n{df[['cue', 'response_set', 'normalized_log_prob']].head(3)}")
 
             # Map to Indices
             row_idx = df['cue'].map(cue_to_idx).values
@@ -230,6 +238,7 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, a
             
             matrices[f"active_{model_name}"] = mat
             print(f"[Active] Processed {model_name} ({mat.sum()} total tokens)")
+            print(f"  > Sample Generated Responses: {cleaned_resps[:5] if cleaned_resps else 'None'}")
             
         except Exception as e:
             print(f"[Active] Error processing {model_name}: {e}")
@@ -330,6 +339,11 @@ def process_activations(input_dir: Path, mappings: dict, allowed_models: list = 
             
             matrices[key] = matrix
             print(f"    > Processed {key}: {hit_count}/{n_cues} coverage, {dim} dims.")
+            if hit_count > 0:
+                 # Sample stats
+                 non_zeros = matrix[matrix != 0]
+                 if len(non_zeros) > 0:
+                     print(f"    > Stats: Mean={non_zeros.mean():.4f}, Std={non_zeros.std():.4f}, Min={non_zeros.min():.4f}, Max={non_zeros.max():.4f}")
             
         except Exception as e:
             print(f"    [Error] Failed to process {model_name}: {e}")
@@ -395,6 +409,9 @@ def derive_dense_embeddings(matrices: dict, n_components: int = 300) -> dict:
         # 3. Sanitize
         embeddings = np.nan_to_num(embeddings, nan=0.0)
         dense_embeddings[key] = embeddings
+        
+        print(f"    > Final Shape: {embeddings.shape}")
+        print(f"    > Sample Vector (first 5 dims of first row): {embeddings[0, :5]}")
         
     return dense_embeddings
 
