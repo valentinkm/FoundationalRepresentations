@@ -27,7 +27,9 @@ def main():
     parser = argparse.ArgumentParser(description="Run the full Behavioral Representation Pipeline.")
     parser.add_argument('--models', nargs='*', help="List of models to process (substring match). If empty, runs all.")
     parser.add_argument('--skip_vectorize', action='store_true', help="Skip the vectorization step.")
-    parser.add_argument('--skip_predict', action='store_true', help="Skip the prediction step.")
+    parser.add_argument('--skip_predict', action='store_true', help="Skip the prediction (human) step.")
+    parser.add_argument('--skip_consistency', action='store_true', help="Skip the self-consistency step.")
+    parser.add_argument('--verbose', action='store_true', help="Enable verbose logging.")
     args = parser.parse_args()
 
     # Paths
@@ -62,13 +64,15 @@ def main():
         ]
         if args.models:
             cmd.extend(['--models'] + args.models)
+        if args.verbose:
+            cmd.append('--verbose')
         run_command(cmd)
     else:
         print("\n[Pipeline] Skipping Vectorization.")
 
-    # 2. Prediction
+    # 2. Prediction (Human)
     if not args.skip_predict:
-        print("\n=== STEP 2: PREDICTION ===")
+        print("\n=== STEP 2: PREDICTION (HUMAN NORMS) ===")
         cmd = [
             sys.executable, str(predict_script),
             '--embeddings_path', str(embeddings_pkl),
@@ -77,9 +81,31 @@ def main():
         ]
         if args.models:
             cmd.extend(['--models'] + args.models)
+        if args.verbose:
+            cmd.append('--verbose')
         run_command(cmd)
     else:
-        print("\n[Pipeline] Skipping Prediction.")
+        print("\n[Pipeline] Skipping Prediction (Human).")
+
+    # 3. Prediction (Self-Consistency)
+    if not args.skip_consistency:
+        print("\n=== STEP 3: PREDICTION (SELF-CONSISTENCY) ===")
+        consistency_script = script_dir / "evaluation" / "predict_self_consistency.py"
+        model_norms_dir = project_root / 'outputs' / 'raw_behavior' / 'model_norms'
+        
+        cmd = [
+            sys.executable, str(consistency_script),
+            '--embeddings_path', str(embeddings_pkl),
+            '--norms_dir', str(model_norms_dir),
+            '--output_dir', str(results_dir)
+        ]
+        if args.models:
+            cmd.extend(['--models'] + args.models)
+        if args.verbose:
+            cmd.append('--verbose')
+        run_command(cmd)
+    else:
+        print("\n[Pipeline] Skipping Prediction (Self-Consistency).")
 
     print("\n[Pipeline] Done.")
 

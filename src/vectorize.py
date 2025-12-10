@@ -39,7 +39,7 @@ MIN_FREQ_THRESHOLD = 5
 # DATA LOADING & PREPROCESSING
 # =============================================================================
 
-def load_human_swow(human_csv_path: Path, min_freq: int) -> tuple[pd.DataFrame, dict, dict]:
+def load_human_swow(human_csv_path: Path, min_freq: int, verbose: bool = False) -> tuple[pd.DataFrame, dict, dict]:
     """
     Load SWOW to define the 'Canonical Vocabulary'.
     Returns:
@@ -81,12 +81,13 @@ def load_human_swow(human_csv_path: Path, min_freq: int) -> tuple[pd.DataFrame, 
     }
     
     print(f"[Vocab] Defined Space: {len(all_cues)} Cues x {len(all_responses)} Responses.")
-    print(f"  > Sample Cues: {all_cues[:5]}")
-    print(f"  > Sample Responses: {all_responses[:5]}")
+    if verbose:
+        print(f"  > Sample Cues: {all_cues[:5]}")
+        print(f"  > Sample Responses: {all_responses[:5]}")
     return df_filtered, mappings, valid_words
 
 
-def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None) -> dict:
+def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False) -> dict:
     """
     Ingest 'Passive' CSVs (Logprobs).
     Logic: LogProb -> Exp -> Normalize -> Sparse Matrix.
@@ -139,9 +140,10 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, al
                 print(f"[Passive] {model_name}: No overlap with human vocab. (Dropped {dropped}/{initial_rows} rows)")
                 continue
             
-            print(f"  > {model_name}: Kept {len(df)}/{initial_rows} rows ({len(df)/initial_rows:.1%}). Dropped {dropped}.")
-            if len(df) > 0:
-                print(f"  > Sample Logprobs:\n{df[['cue', 'response_set', 'normalized_log_prob']].head(3)}")
+            if verbose:
+                print(f"  > {model_name}: Kept {len(df)}/{initial_rows} rows ({len(df)/initial_rows:.1%}). Dropped {dropped}.")
+                if len(df) > 0:
+                    print(f"  > Sample Logprobs:\n{df[['cue', 'response_set', 'normalized_log_prob']].head(3)}")
 
             # Map to Indices
             row_idx = df['cue'].map(cue_to_idx).values
@@ -171,7 +173,7 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, al
     return matrices
 
 
-def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None) -> dict:
+def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False) -> dict:
     """
     Ingest 'Active' JSONLs (Generated Text).
     Logic: Raw Text -> Count -> Normalize -> Sparse Matrix.
@@ -238,7 +240,8 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, a
             
             matrices[f"active_{model_name}"] = mat
             print(f"[Active] Processed {model_name} ({mat.sum()} total tokens)")
-            print(f"  > Sample Generated Responses: {cleaned_resps[:5] if cleaned_resps else 'None'}")
+            if verbose:
+                print(f"  > Sample Generated Responses: {cleaned_resps[:5] if cleaned_resps else 'None'}")
             
         except Exception as e:
             print(f"[Active] Error processing {model_name}: {e}")
@@ -249,7 +252,7 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, a
 # ACTIVATIONS (Raw Dense Vectors)
 # =============================================================================
 
-def process_activations(input_dir: Path, mappings: dict, allowed_models: list = None) -> dict:
+def process_activations(input_dir: Path, mappings: dict, allowed_models: list = None, verbose: bool = False) -> dict:
     """
     Ingest 'Activation' CSVs (Raw Dense Vectors).
     Logic: Raw Vector -> Align to Cue Index -> Dense Matrix.
@@ -339,7 +342,7 @@ def process_activations(input_dir: Path, mappings: dict, allowed_models: list = 
             
             matrices[key] = matrix
             print(f"    > Processed {key}: {hit_count}/{n_cues} coverage, {dim} dims.")
-            if hit_count > 0:
+            if verbose and hit_count > 0:
                  # Sample stats
                  non_zeros = matrix[matrix != 0]
                  if len(non_zeros) > 0:
@@ -373,7 +376,7 @@ def calculate_ppmi(matrix: csr_matrix, smooth: float = 1e-10) -> csr_matrix:
     
     return csr_matrix((ppmi_values, (rows, cols)), shape=matrix.shape)
 
-def derive_dense_embeddings(matrices: dict, n_components: int = 300) -> dict:
+def derive_dense_embeddings(matrices: dict, n_components: int = 300, verbose: bool = False) -> dict:
     """
     Convert Sparse Count/Prob Matrices -> PPMI -> SVD Dense Vectors.
     """
@@ -410,8 +413,9 @@ def derive_dense_embeddings(matrices: dict, n_components: int = 300) -> dict:
         embeddings = np.nan_to_num(embeddings, nan=0.0)
         dense_embeddings[key] = embeddings
         
-        print(f"    > Final Shape: {embeddings.shape}")
-        print(f"    > Sample Vector (first 5 dims of first row): {embeddings[0, :5]}")
+        if verbose:
+            print(f"    > Final Shape: {embeddings.shape}")
+            print(f"    > Sample Vector (first 5 dims of first row): {embeddings[0, :5]}")
         
     return dense_embeddings
 
@@ -428,13 +432,14 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True, help="Dir to save output pickle")
     parser.add_argument('--n_components', type=int, default=300, help="SVD Dimensions")
     parser.add_argument('--models', nargs='*', help="List of model names to process (substring match)")
+    parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
     args = parser.parse_args()
 
     # 1. Setup
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
     # 2. Build Human Matrix (The Ground Truth for Vocabulary)
-    human_df, mappings, vocab_set = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD)
+    human_df, mappings, vocab_set = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD, verbose=args.verbose)
     
     # Build Human CSR
     # Re-using logic: build count matrix
@@ -448,15 +453,15 @@ def main():
     matrices = {'human_matrix': human_mat}
     
     # Passive
-    matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models))
+    matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose))
     
     # Active
-    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set, allowed_models=args.models))
+    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose))
     
     # Activations (Raw) - These bypass PPMI/SVD
     activation_matrices = {}
     if args.activation_dir:
-        activation_matrices = process_activations(args.activation_dir, mappings, allowed_models=args.models)
+        activation_matrices = process_activations(args.activation_dir, mappings, allowed_models=args.models, verbose=args.verbose)
     else:
         print("[Activations] No directory provided, skipping.")
     
@@ -465,7 +470,7 @@ def main():
     
     # 4. Transform (PPMI -> SVD)
     print("\n[Transformation] Applying PPMI + SVD...")
-    dense_results = derive_dense_embeddings(matrices, n_components=args.n_components)
+    dense_results = derive_dense_embeddings(matrices, n_components=args.n_components, verbose=args.verbose)
     
     # 5. Export
     # Merge dense results (SVD of counts) with raw activation matrices
