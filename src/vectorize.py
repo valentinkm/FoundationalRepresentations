@@ -26,7 +26,9 @@ import argparse
 from scipy.sparse import csr_matrix, hstack
 from sklearn.utils.extmath import randomized_svd
 from scipy.sparse.linalg import svds
+from scipy.sparse.linalg import svds
 import warnings
+import ast
 
 # --- CONSTANTS ---
 ROW_NORM_EPS = 1e-12
@@ -223,6 +225,100 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set) -
     return matrices
 
 # =============================================================================
+# ACTIVATIONS (Raw Dense Vectors)
+# =============================================================================
+
+def process_activations(input_dir: Path, mappings: dict) -> dict:
+    """
+    Ingest 'Activation' CSVs (Raw Dense Vectors).
+    Logic: Raw Vector -> Align to Cue Index -> Dense Matrix.
+    """
+    if not input_dir.exists():
+        print(f"[Activations] Directory not found: {input_dir}")
+        return {}
+
+    matrices = {}
+    cue_to_idx = mappings['cue_to_idx']
+    n_cues = len(cue_to_idx)
+    
+    files = sorted(list(input_dir.glob('*.csv')))
+    print(f"[Activations] Found {len(files)} activation files.")
+
+    # Map filenames to clean keys (optional, but good for consistency)
+    # If filename is "gemma3_27b_embeddings.csv", we might want "activation_gemma3_27b"
+    # For now, we use the stem, prefixed.
+    
+    for fp in files:
+        model_name = fp.stem
+        # Clean up common suffixes if present
+        clean_name = model_name.replace('_embeddings', '')
+        key = f"activation_{clean_name}"
+        
+        print(f"  - Processing {model_name}...")
+        
+        try:
+            df = pd.read_csv(fp, low_memory=False)
+            cols = list(df.columns)
+            if not cols:
+                continue
+                
+            cue_col = cols[0]
+            # Standardize cues
+            df[cue_col] = df[cue_col].astype(str).str.lower().str.strip()
+            
+            # Determine format: String-encoded list OR Column-wise features
+            sample_val = df.iloc[0, 1] if len(df.columns) > 1 else None
+            
+            data_map = {}
+            dim = 0
+            
+            if isinstance(sample_val, str) and str(sample_val).strip().startswith("["):
+                # Format A: String-encoded list "[0.1, 0.2, ...]"
+                # print("    > Type: String-encoded list")
+                # Use ast.literal_eval safely
+                def parse_vec(x):
+                    try:
+                        return np.array(ast.literal_eval(str(x)), dtype=np.float32)
+                    except:
+                        return None
+                        
+                df['vec'] = df.iloc[:, 1].apply(parse_vec)
+                df = df.dropna(subset=['vec'])
+                if df.empty:
+                    print(f"    [Warning] No valid vectors found in {model_name}")
+                    continue
+                    
+                data_map = dict(zip(df[cue_col], df['vec']))
+                dim = len(df['vec'].iloc[0])
+                
+            else:
+                # Format B: Column-wise features
+                # print("    > Type: Column-wise features")
+                # Assuming col 0 is cue, cols 1..N are features
+                vec_data = df.iloc[:, 1:].values.astype(np.float32)
+                data_map = dict(zip(df[cue_col], vec_data))
+                dim = vec_data.shape[1]
+            
+            # Build Matrix aligned to Master Vocab
+            matrix = np.zeros((n_cues, dim), dtype=np.float32)
+            hit_count = 0
+            
+            for cue, idx in cue_to_idx.items():
+                if cue in data_map:
+                    vec = data_map[cue]
+                    if vec.shape[0] == dim:
+                        matrix[idx] = vec
+                        hit_count += 1
+            
+            matrices[key] = matrix
+            print(f"    > Processed {key}: {hit_count}/{n_cues} coverage, {dim} dims.")
+            
+        except Exception as e:
+            print(f"    [Error] Failed to process {model_name}: {e}")
+            
+    return matrices
+
+# =============================================================================
 # TRANSFORMATION (PPMI + SVD)
 # =============================================================================
 
@@ -293,6 +389,7 @@ def main():
     parser.add_argument('--swow_path', type=Path, required=True, help="Path to Human SWOW CSV")
     parser.add_argument('--passive_dir', type=Path, required=True, help="Dir containing Logprob CSVs")
     parser.add_argument('--active_dir', type=Path, required=True, help="Dir containing Generated JSONLs")
+    parser.add_argument('--activation_dir', type=Path, required=False, help="Dir containing Activation CSVs")
     parser.add_argument('--output_dir', type=Path, required=True, help="Dir to save output pickle")
     parser.add_argument('--n_components', type=int, default=300, help="SVD Dimensions")
     args = parser.parse_args()
@@ -318,7 +415,15 @@ def main():
     matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set))
     
     # Active
+    # Active
     matrices.update(process_active_generation(args.active_dir, mappings, vocab_set))
+    
+    # Activations (Raw) - These bypass PPMI/SVD
+    activation_matrices = {}
+    if args.activation_dir:
+        activation_matrices = process_activations(args.activation_dir, mappings)
+    else:
+        print("[Activations] No directory provided, skipping.")
     
     if len(matrices) == 1:
         print("WARNING: No model matrices created. Check input directories.")
@@ -328,16 +433,19 @@ def main():
     dense_results = derive_dense_embeddings(matrices, n_components=args.n_components)
     
     # 5. Export
+    # Merge dense results (SVD of counts) with raw activation matrices
+    final_embeddings = {**dense_results, **activation_matrices}
+    
     export_payload = {
-        'embeddings': dense_results,
+        'embeddings': final_embeddings,
         'mappings': mappings
     }
     
-    out_path = args.output_dir / "behavioral_embeddings.pkl"
+    out_path = args.output_dir / "embeddings.pkl"
     with open(out_path, 'wb') as f:
         pickle.dump(export_payload, f)
         
-    print(f"\n[Success] Saved {len(dense_results)} matrices to {out_path}")
+    print(f"\n[Success] Saved {len(final_embeddings)} matrices to {out_path}")
 
 if __name__ == "__main__":
     # Default paths based on your provided tree
@@ -353,11 +461,13 @@ if __name__ == "__main__":
         default_swow = project_root / 'data' / 'SWOW' / 'Human_SWOW-EN.R100.20180827.csv'
         default_passive = project_root / 'outputs' / 'raw_behavior' / 'model_swow_logprobs'
         default_active = project_root / 'outputs' / 'raw_behavior' / 'model_swow'
+        default_activation = project_root / 'outputs' / 'raw_activations'
         default_out = project_root / 'outputs' / 'matrices'
     except:
         default_swow = Path('.')
         default_passive = Path('.')
         default_active = Path('.')
+        default_activation = Path('.')
         default_out = Path('.')
 
     # Hack to allow running without args if paths match structure
@@ -367,6 +477,7 @@ if __name__ == "__main__":
             '--swow_path', str(default_swow),
             '--passive_dir', str(default_passive),
             '--active_dir', str(default_active),
+            '--activation_dir', str(default_activation),
             '--output_dir', str(default_out)
         ])
         

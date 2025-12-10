@@ -198,7 +198,7 @@ if __name__ == "__main__":
         script_dir = Path(__file__).parent.resolve()
         project_root = script_dir.parent.parent
         
-        default_emb = project_root / 'outputs' / 'matrices' / 'behavioral_embeddings.pkl'
+        default_emb = project_root / 'outputs' / 'matrices' / 'embeddings.pkl'
         default_norms = project_root / 'data' / 'psych_norms' / 'psychnorms_subset_filtered_by_swow.csv'
         # Fallback if filtered subset doesn't exist yet, look for main file or utils location
         if not default_norms.exists():
