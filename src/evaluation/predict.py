@@ -23,6 +23,7 @@ from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import cross_val_score, KFold
+from joblib import Parallel, delayed
 
 # --- CONFIG ---
 DEFAULT_ALPHAS = [1e-3, 1e-2, 1e-1, 1, 10, 100, 1000]
@@ -140,7 +141,27 @@ def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
         print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
-def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowed_models=None, verbose: bool = False):
+def _evaluate_single_norm(emb_name, X_full, cue_to_idx, norms_df, norm, verbose):
+    """Helper for parallel evaluation of a single norm."""
+    X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose)
+    
+    if X is None:
+        return None
+        
+    mean_r2, std_r2 = evaluate_embedding(X, y, verbose=verbose)
+    
+    if np.isnan(mean_r2):
+        return None
+        
+    return {
+        'embedding_source': emb_name,
+        'norm_name': norm,
+        'r2_mean': mean_r2,
+        'r2_std': std_r2,
+        'n_samples': len(overlap)
+    }
+
+def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowed_models=None, verbose: bool = False, n_jobs: int = 1):
     """Main loop over Embeddings x Norms."""
     results = []
     
@@ -149,22 +170,16 @@ def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowe
     print(f"[Judge] Found {len(all_norms)} norms to predict.")
     
     # 2. Identify all embeddings
-    # Filter out metadata keys if any persist
     emb_keys = [k for k in embeddings_dict.keys() if k != 'mappings']
     
-    # Filter by allowed_models if set
     if allowed_models:
-        # Always include 'human' if it exists, or maybe strictly follow user?
-        # Let's strictly follow user, but if they want human they must say it.
-        # BUT, usually we want to compare against human.
-        # Let's assume strict filtering.
         filtered_keys = []
         for k in emb_keys:
             if any(m in k for m in allowed_models):
                 filtered_keys.append(k)
         emb_keys = filtered_keys
         
-    print(f"[Judge] Found {len(emb_keys)} embedding sources.")
+    print(f"[Judge] Found {len(emb_keys)} embedding sources. Processing with n_jobs={n_jobs}...")
     
     cue_to_idx = mappings['cue_to_idx']
     
@@ -175,25 +190,18 @@ def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowe
     for emb_name in emb_keys:
         X_full = embeddings_dict[emb_name]
         
-        for norm in all_norms:
-            X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose)
-            
-            if X is None:
-                # Not enough overlap
-                pbar.update(1)
-                continue
-                
-            mean_r2, std_r2 = evaluate_embedding(X, y, verbose=verbose)
-            
-            if not np.isnan(mean_r2):
-                results.append({
-                    'embedding_source': emb_name,
-                    'norm_name': norm,
-                    'r2_mean': mean_r2,
-                    'r2_std': std_r2,
-                    'n_samples': len(overlap)
-                })
-            
+        # Parallelize norms for this embedding
+        # We do this per embedding to avoid pickling X_full too many times if we flattened everything
+        # Although joblib with shared memory might handle it, this is safer for memory.
+        
+        norm_results = Parallel(n_jobs=n_jobs)(
+            delayed(_evaluate_single_norm)(emb_name, X_full, cue_to_idx, norms_df, norm, verbose)
+            for norm in all_norms
+        )
+        
+        for res in norm_results:
+            if res:
+                results.append(res)
             pbar.update(1)
             
     pbar.close()
@@ -218,6 +226,7 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True, help="Where to save results.csv")
     parser.add_argument('--models', nargs='*', help="List of model names to evaluate (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
+    parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -228,7 +237,7 @@ def main():
     
     # Run Eval
     output_csv = args.output_dir / "evaluation_results.csv"
-    run_evaluation_loop(embeddings, mappings, norms_df, output_csv, allowed_models=args.models, verbose=args.verbose)
+    run_evaluation_loop(embeddings, mappings, norms_df, output_csv, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs)
 
 if __name__ == "__main__":
     import sys

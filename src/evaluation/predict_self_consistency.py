@@ -20,6 +20,7 @@ from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import cross_val_score, KFold
+from joblib import Parallel, delayed
 
 # --- CONFIG ---
 DEFAULT_ALPHAS = [1e-3, 1e-2, 1e-1, 1, 10, 100, 1000]
@@ -145,7 +146,30 @@ def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
         print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
-def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path, verbose: bool = False):
+def _evaluate_single_norm(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose):
+    """Helper for parallel evaluation of a single norm."""
+    X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose)
+    
+    if X is None:
+        if verbose:
+            print(f"    > Skipped (Insufficient Overlap)")
+        return None
+        
+    mean_r2, std_r2 = evaluate_embedding(X, y, verbose=verbose)
+    
+    if np.isnan(mean_r2):
+        return None
+        
+    return {
+        'embedding_source': emb_name,
+        'target_model': matched_model,
+        'norm_name': norm,
+        'r2_mean': mean_r2,
+        'r2_std': std_r2,
+        'n_samples': len(overlap)
+    }
+
+def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path, verbose: bool = False, n_jobs: int = 1):
     """
     Main loop.
     Logic:
@@ -158,16 +182,13 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
     cue_to_idx = mappings['cue_to_idx']
     
     emb_keys = [k for k in embeddings_dict.keys() if k != 'mappings']
-    print(f"[Judge] Found {len(emb_keys)} embedding sources.")
+    print(f"[Judge] Found {len(emb_keys)} embedding sources. Processing with n_jobs={n_jobs}...")
     
     # Progress bar logic is tricky because norms vary per model.
     # We'll just iterate and print.
     
     for emb_name in tqdm(emb_keys, desc="Evaluating Models"):
         # 1. Extract Model Name
-        # Keys are like: 'passive_MODELNAME', 'active_MODELNAME', 'activation_MODELNAME'
-        # We try to match against the keys in model_norms_dict
-        
         matched_model = None
         for model_key in model_norms_dict.keys():
             if model_key in emb_name:
@@ -187,28 +208,15 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
             
         X_full = embeddings_dict[emb_name]
         
-        for norm in all_norms:
-            if verbose:
-                print(f"  - Task: {norm}")
-                
-            X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose)
-            
-            if X is None:
-                if verbose:
-                    print(f"    > Skipped (Insufficient Overlap)")
-                continue
-                
-            mean_r2, std_r2 = evaluate_embedding(X, y, verbose=verbose)
-            
-            if not np.isnan(mean_r2):
-                results.append({
-                    'embedding_source': emb_name,
-                    'target_model': matched_model,
-                    'norm_name': norm,
-                    'r2_mean': mean_r2,
-                    'r2_std': std_r2,
-                    'n_samples': len(overlap)
-                })
+        # Parallelize norms for this embedding
+        norm_results = Parallel(n_jobs=n_jobs)(
+            delayed(_evaluate_single_norm)(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose)
+            for norm in all_norms
+        )
+        
+        for res in norm_results:
+            if res:
+                results.append(res)
                 
     # Save
     res_df = pd.DataFrame(results)
@@ -229,6 +237,7 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True, help="Where to save results.csv")
     parser.add_argument('--models', nargs='*', help="List of model names to evaluate (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
+    parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -243,7 +252,7 @@ def main():
 
     # Run Eval
     output_csv = args.output_dir / "self_consistency_results.csv"
-    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose)
+    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs)
 
 if __name__ == "__main__":
     import sys

@@ -30,26 +30,30 @@ def main():
     parser.add_argument('--skip_predict', action='store_true', help="Skip the prediction (human) step.")
     parser.add_argument('--skip_consistency', action='store_true', help="Skip the self-consistency step.")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging.")
+    parser.add_argument('--n_jobs', type=int, default=-1, help="Number of parallel jobs (default: -1 for all)")
     args = parser.parse_args()
 
-    # Paths
+    # Define paths
     script_dir = Path(__file__).parent.resolve()
+    project_root = script_dir.parent
+    
     vectorize_script = script_dir / "vectorize.py"
     predict_script = script_dir / "evaluation" / "predict.py"
     
-    # Paths (Hardcoded defaults for now, matching the repo structure)
-    project_root = script_dir.parent
-    swow_path = project_root / 'data' / 'SWOW' / 'Human_SWOW-EN.R100.20180827.csv'
-    passive_dir = project_root / 'outputs' / 'raw_behavior' / 'model_swow_logprobs'
-    active_dir = project_root / 'outputs' / 'raw_behavior' / 'model_swow'
-    activation_dir = project_root / 'outputs' / 'raw_activations'
-    matrices_dir = project_root / 'outputs' / 'matrices'
-    norms_path = project_root / 'data' / 'psych_norms' / 'psychnorms_subset_filtered_by_swow.csv'
-    # Fallback for norms
+    # Data Paths
+    # Data Paths
+    swow_path = project_root / "data" / "SWOW" / "Human_SWOW-EN.R100.20180827.csv"
+    passive_dir = project_root / "outputs" / "raw_behavior" / "model_swow_logprobs"
+    active_dir = project_root / "outputs" / "raw_behavior" / "model_swow"
+    activation_dir = project_root / "outputs" / "raw_activations"
+    
+    norms_path = project_root / "data" / "psych_norms" / "psychnorms_subset_filtered_by_swow.csv"
     if not norms_path.exists():
-         norms_path = project_root / 'data' / 'SWOW' / 'utils' / 'psychnorms_subset_filtered_by_swow.csv'
-    results_dir = project_root / 'outputs' / 'results'
-    embeddings_pkl = matrices_dir / "embeddings.pkl"
+         norms_path = project_root / "data" / "SWOW" / "utils" / "psychnorms_subset_filtered_by_swow.csv"
+
+    output_dir = project_root / "outputs" / "matrices"
+    embeddings_pkl = output_dir / "embeddings.pkl"
+    results_dir = project_root / "outputs" / "results"
 
     # 1. Vectorization
     if not args.skip_vectorize:
@@ -60,12 +64,14 @@ def main():
             '--passive_dir', str(passive_dir),
             '--active_dir', str(active_dir),
             '--activation_dir', str(activation_dir),
-            '--output_dir', str(matrices_dir)
+            '--output_dir', str(output_dir),
+            '--n_jobs', str(args.n_jobs)
         ]
         if args.models:
             cmd.extend(['--models'] + args.models)
         if args.verbose:
             cmd.append('--verbose')
+        
         run_command(cmd)
     else:
         print("\n[Pipeline] Skipping Vectorization.")
@@ -77,7 +83,8 @@ def main():
             sys.executable, str(predict_script),
             '--embeddings_path', str(embeddings_pkl),
             '--norms_path', str(norms_path),
-            '--output_dir', str(results_dir)
+            '--output_dir', str(results_dir),
+            '--n_jobs', str(args.n_jobs)
         ]
         if args.models:
             cmd.extend(['--models'] + args.models)
@@ -97,7 +104,8 @@ def main():
             sys.executable, str(consistency_script),
             '--embeddings_path', str(embeddings_pkl),
             '--norms_dir', str(model_norms_dir),
-            '--output_dir', str(results_dir)
+            '--output_dir', str(results_dir),
+            '--n_jobs', str(args.n_jobs)
         ]
         if args.models:
             cmd.extend(['--models'] + args.models)
