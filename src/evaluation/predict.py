@@ -60,11 +60,12 @@ def load_human_norms(csv_path: Path):
         
     return df
 
-def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = False):
+def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = False, common_vocab: set = None):
     """
     Intersection of:
     1. Words in the embedding matrix (Rows)
     2. Words in the norm dataset (Rows for specific norm)
+    3. (Optional) Common Vocabulary across all models
     
     Returns: X (features), y (targets), overlapping_words
     """
@@ -77,6 +78,11 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
 
     # Find overlap
     valid_cues = set(cue_to_idx.keys())
+    
+    # Enforce Universal Overlap if provided
+    if common_vocab is not None:
+        valid_cues = valid_cues.intersection(common_vocab)
+        
     available_words = set(sub_df['word'].unique())
     overlap = list(valid_cues.intersection(available_words))
     
@@ -158,9 +164,9 @@ def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
             print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
-def _evaluate_single_norm(emb_name, X_full, cue_to_idx, norms_df, norm, verbose):
+def _evaluate_single_norm(emb_name, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab=None):
     """Helper for parallel evaluation of a single norm."""
-    X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose)
+    X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose, common_vocab=common_vocab)
     
     if X is None:
         return None
@@ -199,6 +205,35 @@ def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowe
     print(f"[Judge] Found {len(emb_keys)} embedding sources. Processing with n_jobs={n_jobs}...")
     
     cue_to_idx = mappings['cue_to_idx']
+    idx_to_cue = {v: k for k, v in cue_to_idx.items()}
+    
+    # --- UNIVERSAL STRICT OVERLAP ---
+    # Compute the intersection of valid words across ALL selected models
+    print("[Judge] Computing Universal Strict Overlap (Common Vocabulary)...")
+    common_vocab = set(cue_to_idx.keys())
+    
+    for k in emb_keys:
+        mat = embeddings_dict[k]
+        # Check for zero vectors
+        if hasattr(mat, "toarray"):
+            norms = np.linalg.norm(mat.toarray(), axis=1)
+        else:
+            norms = np.linalg.norm(mat, axis=1)
+            
+        valid_indices = np.where(norms > 0)[0]
+        valid_words = {idx_to_cue[idx] for idx in valid_indices}
+        
+        before = len(common_vocab)
+        common_vocab.intersection_update(valid_words)
+        after = len(common_vocab)
+        if after < before:
+            print(f"    > {k} reduced vocab from {before} to {after} words.")
+            
+    print(f"[Judge] Final Common Vocabulary Size: {len(common_vocab)}")
+    
+    if len(common_vocab) < MIN_SAMPLES:
+        print(f"[Judge] CRITICAL: Common vocabulary is too small ({len(common_vocab)}). Aborting.")
+        return
     
     # Progress bar logic
     total_steps = len(emb_keys) * len(all_norms)
@@ -208,11 +243,8 @@ def run_evaluation_loop(embeddings_dict, mappings, norms_df, output_path, allowe
         X_full = embeddings_dict[emb_name]
         
         # Parallelize norms for this embedding
-        # We do this per embedding to avoid pickling X_full too many times if we flattened everything
-        # Although joblib with shared memory might handle it, this is safer for memory.
-        
         norm_results = Parallel(n_jobs=n_jobs)(
-            delayed(_evaluate_single_norm)(emb_name, X_full, cue_to_idx, norms_df, norm, verbose)
+            delayed(_evaluate_single_norm)(emb_name, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab)
             for norm in all_norms
         )
         

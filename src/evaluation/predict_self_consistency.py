@@ -77,11 +77,12 @@ def load_model_norms(norms_dir: Path, allowed_models: list = None) -> dict:
             
     return model_norms
 
-def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = False):
+def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = False, common_vocab: set = None):
     """
     Intersection of:
     1. Words in the embedding matrix (Rows)
     2. Words in the norm dataset (Rows for specific norm)
+    3. (Optional) Common Vocabulary across all models
     
     Returns: X (features), y (targets), overlapping_words
     """
@@ -92,6 +93,11 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
 
     # Find overlap
     valid_cues = set(cue_to_idx.keys())
+    
+    # Enforce Universal Overlap if provided
+    if common_vocab is not None:
+        valid_cues = valid_cues.intersection(common_vocab)
+        
     available_words = set(sub_df['word'].unique())
     overlap = list(valid_cues.intersection(available_words))
     
@@ -187,9 +193,9 @@ def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
             print(f"    [Error] Regression failed: {e}")
         return np.nan, np.nan
 
-def _evaluate_single_norm(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose):
-    """Helper for parallel evaluation of a single norm."""
-    X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose)
+def process_single_norm_evaluation(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab=None):
+    """Helper to evaluate a single norm for a given embedding matrix."""
+    X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose, common_vocab=common_vocab)
     
     if X is None:
         if verbose:
@@ -225,10 +231,50 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
     emb_keys = [k for k in embeddings_dict.keys() if k != 'mappings']
     print(f"[Judge] Found {len(emb_keys)} embedding sources. Processing with n_jobs={n_jobs}...")
     
-    # Progress bar logic is tricky because norms vary per model.
-    # We'll just iterate and print.
+    idx_to_cue = {v: k for k, v in cue_to_idx.items()}
     
-    for emb_name in tqdm(emb_keys, desc="Evaluating Models"):
+    # --- UNIVERSAL STRICT OVERLAP ---
+    print("[Judge] Computing Universal Strict Overlap (Common Vocabulary)...")
+    common_vocab = set(cue_to_idx.keys())
+    
+    for k in emb_keys:
+        mat = embeddings_dict[k]
+        if hasattr(mat, "toarray"):
+            norms = np.linalg.norm(mat.toarray(), axis=1)
+        else:
+            norms = np.linalg.norm(mat, axis=1)
+            
+        valid_indices = np.where(norms > 0)[0]
+        valid_words = {idx_to_cue[idx] for idx in valid_indices}
+        
+        before = len(common_vocab)
+        common_vocab.intersection_update(valid_words)
+        after = len(common_vocab)
+        if after < before:
+            print(f"    > {k} reduced vocab from {before} to {after} words.")
+            
+    print(f"[Judge] Final Common Vocabulary Size: {len(common_vocab)}")
+    
+    if len(common_vocab) < MIN_SAMPLES:
+        print(f"[Judge] CRITICAL: Common vocabulary is too small ({len(common_vocab)}). Aborting.")
+        return
+
+    # Progress bar logic
+    # Calculate total steps by summing the number of norms for each matched model
+    total_steps = 0
+    for emb_name in emb_keys:
+        matched_model = None
+        for model_key in model_norms_dict.keys():
+            if model_key in emb_name:
+                matched_model = model_key
+                break
+        if matched_model:
+            norms_df = model_norms_dict[matched_model]
+            total_steps += len(norms_df['norm'].unique())
+            
+    pbar = tqdm(total=total_steps, desc="Evaluating")
+    
+    for emb_name in emb_keys:
         # 1. Extract Model Name
         matched_model = None
         for model_key in model_norms_dict.keys():
@@ -250,15 +296,17 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
         X_full = embeddings_dict[emb_name]
         
         # Parallelize norms for this embedding
-        norm_results = Parallel(n_jobs=n_jobs)(
-            delayed(_evaluate_single_norm)(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose)
+        results_for_model = Parallel(n_jobs=n_jobs)(
+            delayed(process_single_norm_evaluation)(
+                emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab
+            )
             for norm in all_norms
         )
         
-        for res in norm_results:
+        for res in results_for_model:
             if res:
                 results.append(res)
-                
+            pbar.update(1)    
     # Save
     res_df = pd.DataFrame(results)
     res_df.to_csv(output_path, index=False)
