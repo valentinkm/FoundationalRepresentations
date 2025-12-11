@@ -24,17 +24,20 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 # =============================================================================
 
 MODELS_CONFIG = {
-    # --- PRODUCTION MODELS ---
+    "gemma27b": "google/gemma-3-27b-it",
+    "mistral24b": "mistralai/Mistral-Small-24B-Instruct-2501",
+    "qwen32b": "Qwen/Qwen3-32B",
+    "llama31_8b_it": "meta-llama/Llama-3.1-8B-Instruct",
+    "llama33_70b_it": "meta-llama/Llama-3.3-70B-Instruct",
+    "olmo2_7b_it": "allenai/OLMo-2-1124-7B-Instruct",
+    "falcon3_10b_it": "tiiuae/Falcon3-10B-Instruct",
+    "gptoss_20b": "openai/gpt-oss-20b",
+    
+    # Legacy keys for compatibility if needed, mapped to new paths
     "llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
-    "llama-3.3-70b-instruct": "meta-llama/Llama-3.3-70B-Instruct", 
-    "mistral-nemo-12b":      "mistralai/Mistral-Nemo-Instruct-v1",
-    "qwen2.5-32b-instruct":  "Qwen/Qwen2.5-32B-Instruct",
-    "gemma-2-27b-it":        "google/gemma-2-27b-it",
-    "olmo-2-7b-instruct":    "allenai/OLMo-2-1124-7B-Instruct",
-    "falcon-3-10b-instruct": "tiiuae/Falcon-3-10B-Instruct",
     
     # --- TEST/DEBUG MODEL ---
-    "debug-model":           "meta-llama/Llama-3.1-8B-Instruct" 
+    "debug-model": "meta-llama/Llama-3.1-8B-Instruct" 
 }
 
 # Generation Parameters
@@ -50,8 +53,13 @@ SAMPLES_PER_CUE = 100
 BATCH_SIZE_PER_PASS = 10      
 
 # Prompt
-SYSTEM_PROMPT = "You are a participant in a word association study."
-USER_TEMPLATE = "List exactly 3 words associated with: '{}'. Return only the words separated by commas. Do not write full sentences."
+# Prompt (Matched to wa_score.py)
+SYSTEM_PROMPT = ""  # wa_score uses empty system prompt
+USER_TEMPLATE = (
+    "You are participating in a word association task. "
+    "Think of the first three words that come to mind when you see the word \"{}\". "
+    "Use mostly single words."
+)
 
 # =============================================================================
 # 2. UTILITIES
