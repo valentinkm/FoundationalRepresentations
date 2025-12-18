@@ -364,59 +364,108 @@ def calculate_ppmi(matrix: csr_matrix, smooth: float = 1e-10) -> csr_matrix:
     
     return csr_matrix((ppmi_values, (rows, cols)), shape=matrix.shape)
 
-def _process_single_transform(key: str, mat: csr_matrix, n_components: int, verbose: bool):
-    """Helper for parallel PPMI+SVD."""
+def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, verbose: bool):
+    """Helper for parallel PPMI+SVD with Multi-Dim Output."""
     if key == 'mappings': return None
     
-    print(f"  - Transforming {key}...")
+    # Identify Model Name from Key
+    # keys: 'passive_model', 'active_model', 'passive_contrastive_model'
+    clean_name = key.replace('passive_', '').replace('active_', '').replace('contrastive_', '')
     
-    # 1. PPMI
-    ppmi = calculate_ppmi(mat.astype(np.float64))
+    configs = []
     
-    # 2. SVD
-    min_dim = min(ppmi.shape)
-    k = min(n_components, min_dim - 1)
+    # 1. Standard 300d
+    configs.append((300, "_300d"))
     
-    if k < 2:
-        print(f"    WARNING: Matrix too small for SVD ({min_dim}). Returning Zeros.")
-        embeddings = np.zeros((ppmi.shape[0], n_components))
-    else:
-        try:
-            U, Sigma, VT = svds(ppmi, k=k)
-            idx = np.argsort(Sigma)[::-1]
-            U, Sigma = U[:, idx], Sigma[idx]
-            embeddings = U * np.sqrt(Sigma)
-        except Exception as e:
-            print(f"    SVD Failed ({e}). Using randomized SVD.")
-            U, Sigma, VT = randomized_svd(ppmi, n_components=k, random_state=42)
-            embeddings = U * np.sqrt(Sigma)
-            
-    # 3. Sanitize
-    embeddings = np.nan_to_num(embeddings, nan=0.0)
-    
-    if verbose:
-        print(f"    > Final Shape: {embeddings.shape}")
-        print(f"    > Sample Vector (first 5 dims of first row): {embeddings[0, :5]}")
-        # Stats
-        non_zeros = embeddings[embeddings != 0]
-        if len(non_zeros) > 0:
-             print(f"    > Stats: Mean={non_zeros.mean():.4f}, Std={non_zeros.std():.4f}, Min={non_zeros.min():.4f}, Max={non_zeros.max():.4f}")
-        
-    return key, embeddings
+    # 2. High Dim (if activation dim found)
+    if clean_name in activation_dims:
+        target_d = activation_dims[clean_name]
+        if target_d != 300: # Avoid duplicate if by chance it's 300
+             configs.append((target_d, f"_{target_d}d"))
+             
+    print(f"  - Transforming {key} -> {len(configs)} variants: {[c[1] for c in configs]}")
 
-def derive_dense_embeddings(matrices: dict, n_components: int = 300, verbose: bool = False, n_jobs: int = 1) -> dict:
+    # PPMI
+    ppmi = calculate_ppmi(mat.astype(np.float64))
+    min_dim = min(ppmi.shape)
+    
+    # Optimization: Run SVD once for max requested k
+    max_k = max(c[0] for c in configs)
+    actual_k = min(max_k, min_dim - 1)
+    
+    results = []
+    
+    if actual_k < 2:
+         print(f"    WARNING: Matrix too small for SVD ({min_dim}). Returning Zeros.")
+         for d, suffix in configs:
+             results.append((f"{key}{suffix}", np.zeros((ppmi.shape[0], d))))
+         return results
+
+    try:
+        U, Sigma, VT = svds(ppmi, k=actual_k)
+        # Sort (svds returns increasing order)
+        idx = np.argsort(Sigma)[::-1]
+        U, Sigma = U[:, idx], Sigma[idx]
+        
+        for d, suffix in configs:
+            eff_d = min(d, actual_k)
+            
+            U_slice = U[:, :eff_d]
+            S_slice = Sigma[:eff_d]
+            emb = U_slice * np.sqrt(S_slice)
+            
+            # Pad if rank deficient or if max_k was lower than d (unlikely given max_k logic, but safe to have)
+            if emb.shape[1] < d:
+                padding = d - emb.shape[1]
+                emb = np.pad(emb, ((0,0), (0, padding)), mode='constant')
+                
+            results.append((f"{key}{suffix}", emb))
+            
+    except Exception as e:
+        print(f"    SVD Failed ({e}). Using randomized SVD fallback.")
+        U, Sigma, VT = randomized_svd(ppmi, n_components=actual_k, random_state=42)
+        
+        for d, suffix in configs:
+            eff_d = min(d, actual_k)
+            U_slice = U[:, :eff_d]
+            S_slice = Sigma[:eff_d]
+            emb = U_slice * np.sqrt(S_slice)
+            
+            if emb.shape[1] < d:
+                padding = d - emb.shape[1]
+                emb = np.pad(emb, ((0,0), (0, padding)), mode='constant')
+            
+            results.append((f"{key}{suffix}", emb))
+
+    # Sanitize
+    sanitized = []
+    for k_out, emb in results:
+        emb = np.nan_to_num(emb, nan=0.0)
+        sanitized.append((k_out, emb))
+        if verbose:
+             print(f"    > {k_out}: {emb.shape}")
+             
+    return sanitized
+
+def derive_dense_embeddings(matrices: dict, activation_dims: dict, verbose: bool = False, n_jobs: int = 1) -> dict:
     """
-    Convert Sparse Count/Prob Matrices -> PPMI -> SVD Dense Vectors.
+    Convert Sparse Count/Prob Matrices -> PPMI -> SVD Dense Vectors (Multi-Dim).
     """
-    print(f"[Transformation] Applying PPMI + SVD with n_jobs={n_jobs}...")
+    print(f"[Transformation] Applying PPMI + SVD (All Variants) with n_jobs={n_jobs}...")
     
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_single_transform)(key, mat, n_components, verbose)
+        delayed(_process_single_transform)(key, mat, activation_dims, verbose)
         for key, mat in matrices.items()
         if key != 'mappings'
     )
     
-    dense_embeddings = {k: v for r in results if r for k, v in [r]}
+    # Flatten list of lists
+    dense_embeddings = {}
+    for sublist in results:
+        if sublist:
+            for k, v in sublist:
+                dense_embeddings[k] = v
+                
     return dense_embeddings
 
 # =============================================================================
@@ -427,10 +476,10 @@ def main():
     parser = argparse.ArgumentParser(description="Build Behavioral Vectors (Passive & Active).")
     parser.add_argument('--swow_path', type=Path, required=True, help="Path to Human SWOW CSV")
     parser.add_argument('--passive_dir', type=Path, required=True, help="Dir containing Logprob CSVs")
+    parser.add_argument('--deranged_dir', type=Path, required=False, help="Dir containing Contrastive (Deranged) Logprob CSVs")
     parser.add_argument('--active_dir', type=Path, required=True, help="Dir containing Generated JSONLs")
-    parser.add_argument('--activation_dir', type=Path, required=False, help="Dir containing Activation CSVs")
+    parser.add_argument('--activation_dir', type=Path, required=True, help="Dir containing Activation CSVs (Required for High-Dim)")
     parser.add_argument('--output_dir', type=Path, required=True, help="Dir to save output pickle")
-    parser.add_argument('--n_components', type=int, default=300, help="SVD Dimensions")
     parser.add_argument('--models', nargs='*', help="List of model names to process (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
     parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs (-1 for all)")
@@ -456,24 +505,49 @@ def main():
     # Passive
     matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs))
     
+    # Contrastive (Deranged)
+    if args.deranged_dir:
+        print("\n--- Processing Contrastive (Deranged) Data ---")
+        # We reuse the passive processor but keys come back as 'passive_{model}'
+        deranged_mats = process_passive_logprobs(args.deranged_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs)
+        for k, v in deranged_mats.items():
+            # k is 'passive_modelname' -> want 'passive_contrastive_modelname'
+            new_k = k.replace('passive_', 'passive_contrastive_')
+            matrices[new_k] = v
+    else:
+        print("[Info] No deranged_dir provided. Skipping Contrastive Embeddings.")
+
     # Active
     matrices.update(process_active_generation(args.active_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs))
     
     # Activations (Raw) - These bypass PPMI/SVD
+    # WE NEED THEM FOR DIMS
     activation_matrices = {}
     if args.activation_dir:
         activation_matrices = process_activations(args.activation_dir, mappings, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs)
     else:
-        print("[Activations] No directory provided, skipping.")
+        print("[Error] Activation Dir required for Unified Vectorization (to determine High Dims).")
+        return
     
     if len(matrices) == 1:
         print("WARNING: No model matrices created. Check input directories.")
     
-    # 4. Transform (PPMI -> SVD)
-    dense_results = derive_dense_embeddings(matrices, n_components=args.n_components, verbose=args.verbose, n_jobs=args.n_jobs)
+    # Extract Dims
+    activation_dims = {}
+    for k, mat in activation_matrices.items():
+        m_name = k.replace('activation_', '')
+        if hasattr(mat, "shape"):
+             d = mat.shape[1]
+        else:
+             d = len(mat[0])
+        activation_dims[m_name] = d
+        print(f"[Dims] {m_name} -> {d}d")
+
+    # 4. Transform (PPMI -> SVD (300d + HighDim))
+    dense_results = derive_dense_embeddings(matrices, activation_dims=activation_dims, verbose=args.verbose, n_jobs=args.n_jobs)
     
     # 5. Export
-    # Merge dense results (SVD of counts) with raw activation matrices
+    # Merge dense results with raw activation matrices
     final_embeddings = {**dense_results, **activation_matrices}
     
     export_payload = {
@@ -488,7 +562,6 @@ def main():
     print(f"\n[Success] Saved {len(final_embeddings)} matrices to {out_path}")
 
 if __name__ == "__main__":
-    # Default paths based on your provided tree
     try:
         script_dir = Path(__file__).parent.resolve()
         project_root = script_dir.parent

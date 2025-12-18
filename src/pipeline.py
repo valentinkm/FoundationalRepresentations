@@ -1,19 +1,30 @@
 """
 src/pipeline.py
 
-Orchestration script for the Behavioral Representation Pipeline.
-Runs:
-1. Vectorization (src/vectorize.py)
-2. Prediction (src/evaluation/predict.py)
+Orchestration script for the Foundational Representations Pipeline.
+
+This script executes the end-to-end workflow to generate, evaluate, and analyze
+semantic representations from Large Language Models (LLMs).
+
+Workflow Stages:
+1.  **Vectorization (Standard)**: Converts raw model outputs (logprobs/tokens) into 300d embeddings.
+2.  **Prediction (Human)**: [Optional] Evaluates embeddings against human psycholinguistic norms.
+3.  **Self-Consistency (Standard)**: Evaluates 300d embeddings against the model's own norms (Self-Prediction).
+4.  **Robustness & Specificity**:
+    - Generates High-Dimensional embeddings (matched to model activations).
+    - Runs Cross-Evaluation (All-vs-All) to determine model specificity.
+5.  **Consolidation**: Merges all results into a single master CSV.
 
 Usage:
-    python src/pipeline.py --models qwen gpt --skip_vectorize
+    python src/pipeline.py --n_jobs 40
+    python src/pipeline.py --run_predict_human --verbose
 """
 
 import argparse
 import subprocess
 import sys
 from pathlib import Path
+import pandas as pd
 
 def run_command(cmd):
     print(f"\n[Pipeline] Running: {' '.join(cmd)}")
@@ -38,7 +49,6 @@ def main():
     project_root = script_dir.parent
     
     vectorize_script = script_dir / "vectorize.py"
-    high_dim_script = script_dir / "vectorize_high_dim.py"
     predict_script = script_dir / "evaluation" / "predict.py"
     
     # Data Paths
@@ -54,8 +64,10 @@ def main():
 
     output_dir = project_root / "outputs" / "matrices"
     embeddings_pkl = output_dir / "embeddings.pkl"
-    high_dim_embeddings_pkl = output_dir / "embeddings_high_dim.pkl"
     results_dir = project_root / "outputs" / "results"
+    
+    # Deranged Dir for Contrastive
+    deranged_dir = project_root / "outputs" / "raw_behavior" / "model_swow_logprobs_deranged"
 
     # 1. Vectorization
     if not args.skip_vectorize:
@@ -73,6 +85,12 @@ def main():
             cmd.extend(['--models'] + args.models)
         if args.verbose:
             cmd.append('--verbose')
+            
+        # Add Deranged Dir if it exists
+        if deranged_dir.exists():
+             cmd.extend(['--deranged_dir', str(deranged_dir)])
+        else:
+             print(f"[Pipeline] Warning: Deranged dir not found at {deranged_dir}")
         
         run_command(cmd)
     else:
@@ -96,75 +114,60 @@ def main():
     else:
         print("\n[Pipeline] Skipping Prediction (Human).")
 
-    # 3. Prediction (Self-Consistency)
+    # 4. Prediction (Self-Consistency & Robustness)
+    # UNIFIED STEP: Run predict_self_consistency with --cross_evaluate
+    # This covers:
+    # 1. Self-Consistency (Model A -> Model A Norms)
+    # 2. Specificity (Model A -> Model B Norms)
+    # 3. All Variants (300d, High-Dim, Contrastive) are in the single embeddings.pkl
+    
     if not args.skip_consistency:
-        print("\n=== STEP 3: PREDICTION (SELF-CONSISTENCY) ===")
+        print("\n=== STEP 3: SELF-CONSISTENCY & SPECIFICITY (UNIFIED) ===")
         consistency_script = script_dir / "evaluation" / "predict_self_consistency.py"
         model_norms_dir = project_root / 'outputs' / 'raw_behavior' / 'model_norms'
+        
+        # We output to results/self_consistency_results.csv 
+        # (The script defaults to this name in output_dir)
         
         cmd = [
             sys.executable, str(consistency_script),
             '--embeddings_path', str(embeddings_pkl),
             '--norms_dir', str(model_norms_dir),
             '--output_dir', str(results_dir),
-            '--n_jobs', str(args.n_jobs)
+            '--n_jobs', str(args.n_jobs),
+            '--cross_evaluate' 
         ]
         if args.models:
             cmd.extend(['--models'] + args.models)
         if args.verbose:
             cmd.append('--verbose')
+        
         run_command(cmd)
     else:
         print("\n[Pipeline] Skipping Prediction (Self-Consistency).")
 
-    # 4. Robustness (High Dim + Cross Evaluation)
-    if not args.skip_consistency:
-        print("\n=== STEP 4: ROBUSTNESS & SPECIFICITY (HIGH DIM CROSS-EVAL) ===")
-        # 4a. High-Dim Vectorization
-        print("  [4a] Creating High Dimension Embeddings...")
-        cmd_vec = [
-            sys.executable, str(high_dim_script),
-            '--swow_path', str(swow_path),
-            '--passive_dir', str(passive_dir),
-            '--active_dir', str(active_dir),
-            '--activation_dir', str(activation_dir),
-            '--output_dir', str(output_dir),
-            '--n_jobs', str(args.n_jobs)
-        ]
-        if args.models:
-            cmd_vec.extend(['--models'] + args.models)
-        if args.verbose:
-            cmd_vec.append('--verbose')
+    # 5. Consolidation (Simplified - just checking the main file)
+    print("\n=== STEP 4: SUMMARY ===")
+    
+    std_res_path = results_dir / "self_consistency_results.csv"
+    if std_res_path.exists():
+        df = pd.read_csv(std_res_path)
+        print(f"\n[Summary] Loaded {len(df)} results from {std_res_path.name}")
         
-        # We only run this if not skip_vectorize? Or separate flag?
-        # Assuming tied to 'skip_vectorize' for simplicity, but robustness is new. 
-        # Let's check skip_vectorize here too.
-        if not args.skip_vectorize:
-            run_command(cmd_vec)
+        print("\n--- Leaderboard (Top 10 by R^2) ---")
+        # Group by embedding source to see best performers
+        # summary = df.groupby('embedding_source')['r2_mean'].mean().sort_values(ascending=False).head(15)
+        # Actually just show top rows
+        cols = ['embedding_source', 'target_model', 'norm', 'r2']
+        if all(c in df.columns for c in cols):
+             print(df.sort_values('r2', ascending=False).head(10)[cols])
         else:
-             print("  [Skipped 4a] Vectorization skipped via flag.")
+             print(df.head())
+             
+    else:
+        print("[Pipeline] No results file found.")
 
-        # 4b. Cross Evaluation
-        print("  [4b] Predicting with High Dim Embeddings + Cross Evaluation...")
-        consistency_script = script_dir / "evaluation" / "predict_self_consistency.py"
-        model_norms_dir = project_root / 'outputs' / 'raw_behavior' / 'model_norms'
-        
-        cmd_pred = [
-            sys.executable, str(consistency_script),
-            '--embeddings_path', str(high_dim_embeddings_pkl),
-            '--norms_dir', str(model_norms_dir),
-            '--output_dir', str(results_dir),
-            '--n_jobs', str(args.n_jobs),
-            '--cross_evaluate'
-        ]
-        if args.models:
-            cmd_pred.extend(['--models'] + args.models)
-        if args.verbose:
-            cmd_pred.append('--verbose')
-            
-        run_command(cmd_pred)
-
-    print("\n[Pipeline] Done.")
+    print("\n[Pipeline] Pipeline Finished Successfully.")
 
 if __name__ == "__main__":
     main()

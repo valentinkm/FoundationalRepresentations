@@ -216,7 +216,7 @@ def process_single_norm_evaluation(emb_name, matched_model, X_full, cue_to_idx, 
         'n_samples': len(overlap)
     }
 
-def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path, verbose: bool = False, n_jobs: int = 1):
+def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path, verbose: bool = False, n_jobs: int = 1, cross_evaluate: bool = False):
     """
     Main loop.
     Logic:
@@ -275,38 +275,43 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
     pbar = tqdm(total=total_steps, desc="Evaluating")
     
     for emb_name in emb_keys:
-        # 1. Extract Model Name
-        matched_model = None
-        for model_key in model_norms_dict.keys():
-            if model_key in emb_name:
-                matched_model = model_key
-                break
+        # Determine Target Models
+        target_models = []
+        if cross_evaluate:
+            target_models = list(model_norms_dict.keys())
+        else:
+            # Self-Consistency Only: Find strict match
+            for model_key in model_norms_dict.keys():
+                if model_key in emb_name:
+                    target_models.append(model_key)
+                    break 
         
-        if not matched_model:
+        if not target_models:
             if verbose:
-                print(f"[Judge] Skipping {emb_name}: No matching norms found.")
+                print(f"[Judge] Skipping {emb_name}: No matching norms found (and distinct cross-eval not requested).")
             continue
             
-        norms_df = model_norms_dict[matched_model]
-        all_norms = sorted(norms_df['norm'].unique())
-        
-        if verbose:
-            print(f"\n[Judge] Evaluating {emb_name} on {matched_model} norms ({len(all_norms)} tasks)...")
+        for matched_model in target_models:
+            norms_df = model_norms_dict[matched_model]
+            all_norms = sorted(norms_df['norm'].unique())
             
-        X_full = embeddings_dict[emb_name]
-        
-        # Parallelize norms for this embedding
-        results_for_model = Parallel(n_jobs=n_jobs)(
-            delayed(process_single_norm_evaluation)(
-                emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab
+            if verbose:
+                print(f"\n[Judge] Evaluating {emb_name} -> {matched_model} norms ({len(all_norms)} norms)...")
+                
+            X_full = embeddings_dict[emb_name]
+            
+            # Parallelize norms for this embedding-model pair
+            results_for_pair = Parallel(n_jobs=n_jobs)(
+                delayed(process_single_norm_evaluation)(
+                    emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab
+                )
+                for norm in all_norms
             )
-            for norm in all_norms
-        )
-        
-        for res in results_for_model:
-            if res:
-                results.append(res)
-            pbar.update(1)    
+            
+            for res in results_for_pair:
+                if res:
+                    results.append(res)
+                pbar.update(1)    
     # Save
     res_df = pd.DataFrame(results)
     res_df.to_csv(output_path, index=False)
@@ -327,6 +332,7 @@ def main():
     parser.add_argument('--models', nargs='*', help="List of model names to evaluate (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
     parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs")
+    parser.add_argument('--cross_evaluate', action='store_true', help="Evaluates EVERY embedding against EVERY model norm (Specificity)")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -341,7 +347,7 @@ def main():
 
     # Run Eval
     output_csv = args.output_dir / "self_consistency_results.csv"
-    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs)
+    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs, cross_evaluate=args.cross_evaluate)
 
 if __name__ == "__main__":
     import sys
