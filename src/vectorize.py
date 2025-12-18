@@ -505,15 +505,58 @@ def main():
     # Passive
     matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs))
     
-    # Contrastive (Deranged)
+    # Contrastive (Joint Latent Space)
+    # Logic: Contrastive = hstack([Real, Deranged])
     if args.deranged_dir:
-        print("\n--- Processing Contrastive (Deranged) Data ---")
-        # We reuse the passive processor but keys come back as 'passive_{model}'
+        print("\n--- Processing Contrastive Data (Joint Latent Space) ---")
         deranged_mats = process_passive_logprobs(args.deranged_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs)
-        for k, v in deranged_mats.items():
-            # k is 'passive_modelname' -> want 'passive_contrastive_modelname'
-            new_k = k.replace('passive_', 'passive_contrastive_')
-            matrices[new_k] = v
+        
+        # 1. Identify common models
+        real_keys = set(k for k in matrices.keys() if k.startswith("passive_") and not "contrastive" in k)
+        
+        for r_key in real_keys:
+            # r_key: 'passive_modelname'
+            # d_key should be: 'passive_modelname' (since loading function names it so) 
+            # BUT process_passive_logprobs returns 'passive_{stem}'. 
+            # We need to match stems.
+            
+            # The deranged files likely have different filenames (e.g. model-deranged.csv)
+            # So process_passive_logprobs will return 'passive_model-deranged'
+            
+            # Heuristic: We need to match 'passive_model' with 'passive_model-deranged' (or similar).
+            # Let's rely on the model name being a substring.
+            
+            model_stem = r_key.replace("passive_", "")
+            
+            # Find matching deranged key
+            d_key = None
+            for candidate in deranged_mats.keys():
+                # Expected: candidate = 'passive_{model}-deranged'
+                if model_stem in candidate:
+                    d_key = candidate
+                    break
+            
+            if d_key:
+                real_mat = matrices[r_key]
+                deranged_mat = deranged_mats[d_key]
+                
+                # Check shapes
+                if real_mat.shape[0] != deranged_mat.shape[0]:
+                    print(f"  [Skip] Contrastive Pair {model_stem}: Row count mismatch ({real_mat.shape[0]} vs {deranged_mat.shape[0]})")
+                    continue
+                
+                # HSTACK
+                # Result shape: (N_Cues, N_Resp * 2)
+                joint_mat = hstack([real_mat, deranged_mat])
+                
+                new_key = f"passive_contrastive_{model_stem}"
+                matrices[new_key] = joint_mat
+                print(f"  [Joint] Created {new_key} with shape {joint_mat.shape}")
+                
+            else:
+                if args.verbose:
+                    print(f"  [Info] No matching deranged data for {model_stem}")
+
     else:
         print("[Info] No deranged_dir provided. Skipping Contrastive Embeddings.")
 
