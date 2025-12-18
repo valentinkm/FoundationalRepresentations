@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run the full Behavioral Representation Pipeline.")
     parser.add_argument('--models', nargs='*', help="List of models to process (substring match). If empty, runs all.")
     parser.add_argument('--skip_vectorize', action='store_true', help="Skip the vectorization step.")
-    parser.add_argument('--skip_predict', action='store_true', help="Skip the prediction (human) step.")
+    parser.add_argument('--run_predict_human', action='store_true', help="Run the prediction (human) step (Skipped by default).")
     parser.add_argument('--skip_consistency', action='store_true', help="Skip the self-consistency step.")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging.")
     parser.add_argument('--n_jobs', type=int, default=-1, help="Number of parallel jobs (default: -1 for all)")
@@ -38,6 +38,7 @@ def main():
     project_root = script_dir.parent
     
     vectorize_script = script_dir / "vectorize.py"
+    high_dim_script = script_dir / "vectorize_high_dim.py"
     predict_script = script_dir / "evaluation" / "predict.py"
     
     # Data Paths
@@ -53,6 +54,7 @@ def main():
 
     output_dir = project_root / "outputs" / "matrices"
     embeddings_pkl = output_dir / "embeddings.pkl"
+    high_dim_embeddings_pkl = output_dir / "embeddings_high_dim.pkl"
     results_dir = project_root / "outputs" / "results"
 
     # 1. Vectorization
@@ -77,7 +79,7 @@ def main():
         print("\n[Pipeline] Skipping Vectorization.")
 
     # 2. Prediction (Human)
-    if not args.skip_predict:
+    if args.run_predict_human:
         print("\n=== STEP 2: PREDICTION (HUMAN NORMS) ===")
         cmd = [
             sys.executable, str(predict_script),
@@ -114,6 +116,53 @@ def main():
         run_command(cmd)
     else:
         print("\n[Pipeline] Skipping Prediction (Self-Consistency).")
+
+    # 4. Robustness (High Dim + Cross Evaluation)
+    if not args.skip_consistency:
+        print("\n=== STEP 4: ROBUSTNESS & SPECIFICITY (HIGH DIM CROSS-EVAL) ===")
+        # 4a. High-Dim Vectorization
+        print("  [4a] Creating High Dimension Embeddings...")
+        cmd_vec = [
+            sys.executable, str(high_dim_script),
+            '--swow_path', str(swow_path),
+            '--passive_dir', str(passive_dir),
+            '--active_dir', str(active_dir),
+            '--activation_dir', str(activation_dir),
+            '--output_dir', str(output_dir),
+            '--n_jobs', str(args.n_jobs)
+        ]
+        if args.models:
+            cmd_vec.extend(['--models'] + args.models)
+        if args.verbose:
+            cmd_vec.append('--verbose')
+        
+        # We only run this if not skip_vectorize? Or separate flag?
+        # Assuming tied to 'skip_vectorize' for simplicity, but robustness is new. 
+        # Let's check skip_vectorize here too.
+        if not args.skip_vectorize:
+            run_command(cmd_vec)
+        else:
+             print("  [Skipped 4a] Vectorization skipped via flag.")
+
+        # 4b. Cross Evaluation
+        print("  [4b] Predicting with High Dim Embeddings + Cross Evaluation...")
+        consistency_script = script_dir / "evaluation" / "predict_self_consistency.py"
+        model_norms_dir = project_root / 'outputs' / 'raw_behavior' / 'model_norms'
+        
+        cmd_pred = [
+            sys.executable, str(consistency_script),
+            '--embeddings_path', str(high_dim_embeddings_pkl),
+            '--norms_dir', str(model_norms_dir),
+            '--output_dir', str(results_dir),
+            '--n_jobs', str(args.n_jobs),
+            '--cross_evaluate'
+        ]
+        if args.models:
+            cmd_pred.extend(['--models'] + args.models)
+        if args.verbose:
+            cmd_pred.append('--verbose')
+            
+        run_command(cmd_pred)
 
     print("\n[Pipeline] Done.")
 
