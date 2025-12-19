@@ -253,14 +253,6 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
     
     emb_keys = [k for k in embeddings_dict.keys() if k != 'mappings']
     
-    # --- FILTERING FOR SPECIFICITY ---
-    if cross_evaluate:
-        # Keep only 300d (passive/active/human) and activations
-        # Logic: k endswith '_300d' OR k.startswith('activation_')
-        pre_count = len(emb_keys)
-        emb_keys = [k for k in emb_keys if k.endswith('_300d') or k.startswith('activation_')]
-        print(f"[Judge] Filtered embeddings for Specificity: {pre_count} -> {len(emb_keys)} (Only 300d & Activations)")
-        
     print(f"[Judge] Found {len(emb_keys)} embedding sources. Processing with n_jobs={n_jobs}...")
     
     idx_to_cue = {v: k for k, v in cue_to_idx.items()}
@@ -311,15 +303,32 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
     
     for emb_name in emb_keys:
         # Determine Target Models
-        target_models = []
+        # Logic:
+        # 1. Identify "Self" model (strict matching)
+        # 2. Identify "Cross" models (if cross_evaluate=True)
+        # 3. Filter "Cross" models based on embedding type (300d/Activation only)
+        # 4. ALWAYS include "Self" model (Self-Consistency) regardless of type
+        
+        target_models = set()
+        
+        # 1. Self Match
+        self_model = None
+        for model_key in model_norms_dict.keys():
+            if model_key in emb_name:
+                self_model = model_key
+                break
+        
+        if self_model:
+            target_models.add(self_model)
+            
+        # 2. Cross Match
         if cross_evaluate:
-            target_models = list(model_norms_dict.keys())
-        else:
-            # Self-Consistency Only: Find strict match
-            for model_key in model_norms_dict.keys():
-                if model_key in emb_name:
-                    target_models.append(model_key)
-                    break 
+            # Only add Cross entries if the embedding is valid for Specificity (300d or Activation)
+            is_valid_for_specificity = emb_name.endswith('_300d') or emb_name.startswith('activation_')
+            
+            if is_valid_for_specificity:
+                for m in model_norms_dict.keys():
+                    target_models.add(m)
         
         if not target_models:
             if verbose:
@@ -366,13 +375,13 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Self-Consistency (Model Embeddings vs Model Norms).")
-    parser.add_argument('--embeddings_path', type=Path, required=True, help="Pickle from vectorize.py")
-    parser.add_argument('--norms_dir', type=Path, required=True, help="Dir containing model norm CSVs")
-    parser.add_argument('--output_dir', type=Path, required=True, help="Where to save results.csv")
-    parser.add_argument('--human_norms_path', type=Path, help="Path to human norms CSV (optional)")
+    parser.add_argument('--embeddings_path', type=Path, default=Path("outputs/matrices/embeddings.pkl"), help="Pickle from vectorize.py")
+    parser.add_argument('--norms_dir', type=Path, default=Path("outputs/raw_behavior/model_norms"), help="Dir containing model norm CSVs")
+    parser.add_argument('--output_dir', type=Path, default=Path("outputs/results"), help="Where to save results.csv")
+    parser.add_argument('--human_norms_path', type=Path, default=Path("data/psych_norms/psychnorms_subset_filtered_by_swow.csv"), help="Path to human norms CSV (optional)")
     parser.add_argument('--models', nargs='*', help="List of model names to evaluate (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
-    parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs")
+    parser.add_argument('--n_jobs', type=int, default=-2, help="Number of parallel jobs (default -2)")
     parser.add_argument('--cross_evaluate', action='store_true', help="Evaluates EVERY embedding against EVERY model norm (Specificity)")
     parser.add_argument('--test_limit', type=int, default=0, help="Test Mode: Limit norms per model")
     args = parser.parse_args()
@@ -412,5 +421,6 @@ if __name__ == "__main__":
             '--norms_dir', str(default_norms_dir),
             '--output_dir', str(default_out)
         ])
+    
         
     main()
