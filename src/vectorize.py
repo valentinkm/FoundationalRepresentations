@@ -198,7 +198,6 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, al
     print(f"[Passive] Found {len(files)} logprob files. Processing with n_jobs={n_jobs}...")
 
     results = Parallel(n_jobs=n_jobs)(
-    results = Parallel(n_jobs=n_jobs)(
         delayed(_process_single_passive)(fp, cue_to_idx, response_to_idx, vocab_set, allowed_models, verbose, allow_deranged, existing_keys)
         for fp in files
     )
@@ -279,7 +278,6 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, a
     files = sorted(list(input_dir.glob('*.jsonl')))
     print(f"[Active] Found {len(files)} generation files. Processing with n_jobs={n_jobs}...")
 
-    results = Parallel(n_jobs=n_jobs)(
     results = Parallel(n_jobs=n_jobs)(
         delayed(_process_single_active)(fp, cue_to_idx, response_to_idx, vocab_set, allowed_models, verbose, existing_keys)
         for fp in files
@@ -383,7 +381,6 @@ def process_activations(input_dir: Path, mappings: dict, allowed_models: list = 
     files = sorted(list(input_dir.glob('*.csv')))
     print(f"[Activations] Found {len(files)} activation files. Processing with n_jobs={n_jobs}...")
 
-    results = Parallel(n_jobs=n_jobs)(
     results = Parallel(n_jobs=n_jobs)(
         delayed(_process_single_activation)(fp, cue_to_idx, allowed_models, verbose, existing_keys)
         for fp in files
