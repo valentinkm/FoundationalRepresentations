@@ -349,7 +349,11 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
         # 2. Cross Match
         if cross_evaluate:
             # Only add Cross entries if the embedding is valid for Specificity (300d or Activation)
-            is_valid_for_specificity = emb_name.endswith('_300d') or emb_name.startswith('activation_')
+            # AND is NOT contrastive (User request: Contrastive only matches Self)
+            is_valid_for_specificity = (
+                (emb_name.endswith('_300d') or emb_name.startswith('activation_')) 
+                and 'contrastive' not in emb_name
+            )
             
             if is_valid_for_specificity:
                 for m in model_norms_dict.keys():

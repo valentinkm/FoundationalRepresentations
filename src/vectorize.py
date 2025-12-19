@@ -88,14 +88,51 @@ def load_human_swow(human_csv_path: Path, min_freq: int, verbose: bool = False) 
     return df_filtered, mappings, valid_words
 
 
-def _process_single_passive(fp: Path, cue_to_idx: dict, response_to_idx: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False):
+def _process_single_passive(fp: Path, cue_to_idx: dict, response_to_idx: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False, allow_deranged: bool = False, existing_keys: set = None):
     """Helper for parallel processing of passive logprobs."""
     model_name = fp.stem
-    if "deranged" in model_name: 
+    if not allow_deranged and "deranged" in model_name: 
         return None
     if allowed_models:
-        if not any(m in model_name for m in allowed_models):
             return None
+
+    # Append Check
+    if existing_keys:
+        # Expected Standard Key
+        std_key = f"passive_{model_name}_300d"
+        # Expected Contrastive Key (if we are building deranged, we assume we want contrastive)
+        # Construct Contrastive Key: 'passive_contrastive_{stem}_300d'
+        # If fp is actually a deranged file, we handle it differently (skipped unless allow_deranged)
+        
+        # If this is a DERANGED file (allow_deranged=True)
+        if allow_deranged:
+            # Deranged files have stems like: 'model-deranged'
+
+            real_stem = model_name.replace('-deranged', '').replace('_deranged', '')
+            contr_key = f"passive_contrastive_{real_stem}_300d"
+            if contr_key in existing_keys:
+                if verbose:
+                     print(f"  [Skip] {model_name} (Contrastive Result {contr_key} exists)")
+                return None
+                
+        else:
+            # Real File
+            # We need to process if:
+            # 1. Standard result is missing.
+            # 2. Contrastive result is missing (and we intend to generate it).
+            
+            contr_key = f"passive_contrastive_{model_name}_300d"
+            
+            # If standard exists, we don't need to re-calc standard.
+            # If contrastive exists, we don't need re-calc contrastive.
+            # If BOTH exist, we can skip.
+            # If Standard exists but Contrastive MISSING -> We yield matrix (so contrastive step can pick it up).
+            # If Standard MISSING -> We yield matrix.
+            
+            if std_key in existing_keys and contr_key in existing_keys:
+                 if verbose: print(f"  [Skip] {model_name} (Results exist)")
+                 return None
+
             
     try:
         df = pd.read_csv(fp)
@@ -145,7 +182,7 @@ def _process_single_passive(fp: Path, cue_to_idx: dict, response_to_idx: dict, v
         print(f"[Passive] Error processing {model_name}: {e}")
         return None
 
-def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False, n_jobs: int = 1) -> dict:
+def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False, n_jobs: int = 1, allow_deranged: bool = False, existing_keys: set = None) -> dict:
     """
     Ingest 'Passive' CSVs (Logprobs).
     Logic: LogProb -> Exp -> Normalize -> Sparse Matrix.
@@ -161,7 +198,8 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, al
     print(f"[Passive] Found {len(files)} logprob files. Processing with n_jobs={n_jobs}...")
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_single_passive)(fp, cue_to_idx, response_to_idx, vocab_set, allowed_models, verbose)
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_single_passive)(fp, cue_to_idx, response_to_idx, vocab_set, allowed_models, verbose, allow_deranged, existing_keys)
         for fp in files
     )
     
@@ -169,12 +207,18 @@ def process_passive_logprobs(input_dir: Path, mappings: dict, vocab_set: set, al
     return matrices
 
 
-def _process_single_active(fp: Path, cue_to_idx: dict, response_to_idx: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False):
+def _process_single_active(fp: Path, cue_to_idx: dict, response_to_idx: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False, existing_keys: set = None):
     """Helper for parallel processing of active generation."""
     model_name = fp.stem
     if allowed_models:
         if not any(m in model_name for m in allowed_models):
             return None
+            
+    if existing_keys:
+         std_key = f"active_{model_name}_300d"
+         if std_key in existing_keys:
+             if verbose: print(f"  [Skip] {model_name} (Result {std_key} exists)")
+             return None
             
     data_rows = []
     try:
@@ -220,7 +264,7 @@ def _process_single_active(fp: Path, cue_to_idx: dict, response_to_idx: dict, vo
         print(f"[Active] Error processing {model_name}: {e}")
         return None
 
-def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False, n_jobs: int = 1) -> dict:
+def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, allowed_models: list = None, verbose: bool = False, n_jobs: int = 1, existing_keys: set = None) -> dict:
     """
     Ingest 'Active' JSONLs (Generated Text).
     Logic: Raw Text -> Count -> Normalize -> Sparse Matrix.
@@ -236,7 +280,8 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, a
     print(f"[Active] Found {len(files)} generation files. Processing with n_jobs={n_jobs}...")
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_single_active)(fp, cue_to_idx, response_to_idx, vocab_set, allowed_models, verbose)
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_single_active)(fp, cue_to_idx, response_to_idx, vocab_set, allowed_models, verbose, existing_keys)
         for fp in files
     )
     
@@ -247,7 +292,7 @@ def process_active_generation(input_dir: Path, mappings: dict, vocab_set: set, a
 # ACTIVATIONS (Raw Dense Vectors)
 # =============================================================================
 
-def _process_single_activation(fp: Path, cue_to_idx: dict, allowed_models: list = None, verbose: bool = False):
+def _process_single_activation(fp: Path, cue_to_idx: dict, allowed_models: list = None, verbose: bool = False, existing_keys: set = None):
     """Helper for parallel processing of activations."""
     model_name = fp.stem
     if allowed_models:
@@ -256,6 +301,11 @@ def _process_single_activation(fp: Path, cue_to_idx: dict, allowed_models: list 
             
     clean_name = model_name.replace('_embeddings', '')
     key = f"activation_{clean_name}"
+    
+    if existing_keys and key in existing_keys:
+         # For activations, the Raw key IS the final key.
+         if verbose: print(f"  [Skip] {model_name} (Result {key} exists)")
+         return None
     
     print(f"  - Processing {model_name}...")
     
@@ -319,7 +369,7 @@ def _process_single_activation(fp: Path, cue_to_idx: dict, allowed_models: list 
         print(f"    [Error] Failed to process {model_name}: {e}")
         return None
 
-def process_activations(input_dir: Path, mappings: dict, allowed_models: list = None, verbose: bool = False, n_jobs: int = 1) -> dict:
+def process_activations(input_dir: Path, mappings: dict, allowed_models: list = None, verbose: bool = False, n_jobs: int = 1, existing_keys: set = None) -> dict:
     """
     Ingest 'Activation' CSVs (Raw Dense Vectors).
     Logic: Raw Vector -> Align to Cue Index -> Dense Matrix.
@@ -334,7 +384,8 @@ def process_activations(input_dir: Path, mappings: dict, allowed_models: list = 
     print(f"[Activations] Found {len(files)} activation files. Processing with n_jobs={n_jobs}...")
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_single_activation)(fp, cue_to_idx, allowed_models, verbose)
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_single_activation)(fp, cue_to_idx, allowed_models, verbose, existing_keys)
         for fp in files
     )
     
@@ -367,6 +418,8 @@ def calculate_ppmi(matrix: csr_matrix, smooth: float = 1e-10) -> csr_matrix:
 def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, verbose: bool):
     """Helper for parallel PPMI+SVD with Multi-Dim Output."""
     if key == 'mappings': return None
+    
+    # Check if Outputs Exist
     
     # Identify Model Name from Key
     # keys: 'passive_model', 'active_model', 'passive_contrastive_model'
@@ -488,30 +541,77 @@ def main():
     # 1. Setup
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 2. Build Human Matrix (The Ground Truth for Vocabulary)
-    human_df, mappings, vocab_set = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD, verbose=args.verbose)
+    # 2. Load Existing & Mappings
+    existing_embeddings = {}
+    existing_keys = set()
+    out_path = args.output_dir / "embeddings.pkl"
     
-    # Build Human CSR
-    # Re-using logic: build count matrix
-    row = human_df['cue'].map(mappings['cue_to_idx']).values
-    col = human_df['response_word'].map(mappings['response_to_idx']).values
-    counts = pd.DataFrame({'row': row, 'col': col}).groupby(['row', 'col']).size().reset_index(name='c')
-    human_mat = csr_matrix((counts['c'], (counts['row'], counts['col'])), 
-                           shape=(len(mappings['cue_to_idx']), len(mappings['response_to_idx'])))
-    
+    if out_path.exists():
+        print(f"[Append] Found existing pickle at {out_path}. Loading...")
+        try:
+            with open(out_path, 'rb') as f:
+                data = pickle.load(f)
+            existing_embeddings = data['embeddings']
+            mappings = data['mappings']
+            existing_keys = set(existing_embeddings.keys())
+            
+            # Reconstruct Human Vocab Set from Mappings (needed for filtering)
+            vocab_set = set(mappings['response_to_idx'].keys())
+            
+            # If 'human_matrix' is in existing_embeddings, we can skip loading SWOW.
+            if 'human_matrix' in existing_embeddings:
+                 print("[Append] Human Matrix exists. Skipping SWOW Load.")
+                 human_mat = existing_embeddings['human_matrix']
+            else:
+                 # load SWOW safely if needed.
+                 print("[Append] Human Matrix missing. Reloading SWOW.")
+                 human_df, _, _ = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD, verbose=args.verbose)
+                 # Reconstruct matrix
+                 row = human_df['cue'].map(mappings['cue_to_idx']).values
+                 col = human_df['response_word'].map(mappings['response_to_idx']).values
+                 counts = pd.DataFrame({'row': row, 'col': col}).groupby(['row', 'col']).size().reset_index(name='c')
+                 human_mat = csr_matrix((counts['c'], (counts['row'], counts['col'])), 
+                            shape=(len(mappings['cue_to_idx']), len(mappings['response_to_idx'])))
+                 
+        except Exception as e:
+            print(f"[Append] Error loading existing pickle: {e}. Starting Fresh.")
+            existing_embeddings = {}
+            existing_keys = set()
+            out_path = args.output_dir / "embeddings.pkl" # Reset
+            # Fallback to load fresh
+            human_df, mappings, vocab_set = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD, verbose=args.verbose)
+            # Build Human
+            row = human_df['cue'].map(mappings['cue_to_idx']).values
+            col = human_df['response_word'].map(mappings['response_to_idx']).values
+            counts = pd.DataFrame({'row': row, 'col': col}).groupby(['row', 'col']).size().reset_index(name='c')
+            human_mat = csr_matrix((counts['c'], (counts['row'], counts['col'])), 
+                                   shape=(len(mappings['cue_to_idx']), len(mappings['response_to_idx'])))
+    else:
+        # Fresh Start
+        human_df, mappings, vocab_set = load_human_swow(args.swow_path, min_freq=MIN_FREQ_THRESHOLD, verbose=args.verbose)
+        # Build Human
+        row = human_df['cue'].map(mappings['cue_to_idx']).values
+        col = human_df['response_word'].map(mappings['response_to_idx']).values
+        counts = pd.DataFrame({'row': row, 'col': col}).groupby(['row', 'col']).size().reset_index(name='c')
+        human_mat = csr_matrix((counts['c'], (counts['row'], counts['col'])), 
+                               shape=(len(mappings['cue_to_idx']), len(mappings['response_to_idx'])))
+
     # 3. Ingest Data
-    matrices = {'human_matrix': human_mat}
+    matrices = {}
+    if 'human_matrix' not in existing_embeddings:
+        matrices['human_matrix'] = human_mat
     
     # Passive
-    matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs))
+    matrices.update(process_passive_logprobs(args.passive_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs, existing_keys=existing_keys))
     
     # Contrastive (Joint Latent Space)
     # Logic: Contrastive = hstack([Real, Deranged])
     if args.deranged_dir:
         print("\n--- Processing Contrastive Data (Joint Latent Space) ---")
-        deranged_mats = process_passive_logprobs(args.deranged_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs)
+        deranged_mats = process_passive_logprobs(args.deranged_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs, allow_deranged=True, existing_keys=existing_keys)
         
         # 1. Identify common models
+        
         real_keys = set(k for k in matrices.keys() if k.startswith("passive_") and not "contrastive" in k)
         
         for r_key in real_keys:
@@ -552,13 +652,13 @@ def main():
         print("[Info] No deranged_dir provided. Skipping Contrastive Embeddings.")
 
     # Active
-    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs))
+    matrices.update(process_active_generation(args.active_dir, mappings, vocab_set, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs, existing_keys=existing_keys))
     
     # Activations (Raw) - These bypass PPMI/SVD
     # WE NEED THEM FOR DIMS
     activation_matrices = {}
     if args.activation_dir:
-        activation_matrices = process_activations(args.activation_dir, mappings, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs)
+        activation_matrices = process_activations(args.activation_dir, mappings, allowed_models=args.models, verbose=args.verbose, n_jobs=args.n_jobs, existing_keys=existing_keys)
     else:
         print("[Error] Activation Dir required for Unified Vectorization (to determine High Dims).")
         return
@@ -566,23 +666,35 @@ def main():
     if len(matrices) == 1:
         print("WARNING: No model matrices created. Check input directories.")
     
-    # Extract Dims
+    # Extract Dims (Combine New + Existing for checks?)
+    
     activation_dims = {}
+    
+    # From New
     for k, mat in activation_matrices.items():
         m_name = k.replace('activation_', '')
-        if hasattr(mat, "shape"):
-             d = mat.shape[1]
-        else:
-             d = len(mat[0])
+        if hasattr(mat, "shape"): d = mat.shape[1]
+        else: d = len(mat[0])
         activation_dims[m_name] = d
-        print(f"[Dims] {m_name} -> {d}d")
+        
+    # From Existing (if needed for a new transformation? unlikely but safe)
+    for k, mat in existing_embeddings.items():
+        if k.startswith('activation_'):
+            m_name = k.replace('activation_', '')
+            if m_name not in activation_dims:
+                 if hasattr(mat, "shape"): d = mat.shape[1]
+                 else: d = len(mat[0])
+                 activation_dims[m_name] = d
+    
+    if args.verbose:
+        print(f"[Dims] Known activation dims: {list(activation_dims.keys())}")
 
     # 4. Transform (PPMI -> SVD (300d + HighDim))
     dense_results = derive_dense_embeddings(matrices, activation_dims=activation_dims, verbose=args.verbose, n_jobs=args.n_jobs)
     
     # 5. Export
-    # Merge dense results with raw activation matrices
-    final_embeddings = {**dense_results, **activation_matrices}
+    # Merge dense results with raw activation matrices AND Existing
+    final_embeddings = {**existing_embeddings, **dense_results, **activation_matrices}
     
     export_payload = {
         'embeddings': final_embeddings,
@@ -590,7 +702,7 @@ def main():
     }
     
     out_path = args.output_dir / "embeddings.pkl"
-    with open(out_path, 'wb') as f:
+    with open(out_path, 'wb') as f: # Overwrite with the merged full dict
         pickle.dump(export_payload, f)
         
     print(f"\n[Success] Saved {len(final_embeddings)} matrices to {out_path}")
