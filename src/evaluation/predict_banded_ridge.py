@@ -48,7 +48,8 @@ def load_data(pkl_path: Path, norms_dir: Path, allowed_models: list = None):
             df = pd.read_csv(fp)
             # Basic clean
             df['word'] = df['word'].astype(str).str.lower().str.strip()
-            df = df.dropna(subset=['cleaned_rating'])
+            df = df.dropna(subset=['cleaned_rating', 'norm'])
+            df['norm'] = df['norm'].astype(str).str.strip()
             model_norms[fp.stem] = df
         except Exception as e:
             print(f"[Loader] Failed to load {fp}: {e}")

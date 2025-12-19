@@ -34,18 +34,19 @@ def load_embeddings(pkl_path: Path):
         data = pickle.load(f)
     return data['embeddings'], data['mappings']
 
-def load_model_norms(norms_dir: Path, allowed_models: list = None) -> dict:
+def load_model_norms(norms_dir: Path, human_norms_path: Path = None, allowed_models: list = None) -> dict:
     """
     Load all model norm CSVs from the directory.
     Returns: dict { 'model_name': pd.DataFrame }
     """
     if not norms_dir.exists():
         print(f"[Loader] Directory not found: {norms_dir}")
-        return {}
-        
-    model_norms = {}
-    files = sorted(list(norms_dir.glob('*.csv')))
-    print(f"[Loader] Found {len(files)} model norm files.")
+        model_norms = {}
+    else:
+        model_norms = {}
+        files = sorted(list(norms_dir.glob('*.csv')))
+        print(f"[Loader] Found {len(files)} model norm files.")
+
     
     for fp in files:
         # File name is usually "model-name.csv"
@@ -75,6 +76,28 @@ def load_model_norms(norms_dir: Path, allowed_models: list = None) -> dict:
         except Exception as e:
             print(f"[Loader] Error loading {model_name}: {e}")
             
+    # --- Inject Human Norms ---
+    if human_norms_path and human_norms_path.exists():
+        print(f"[Loader] Loading Human Norms from {human_norms_path}...")
+        try:
+            df_human = pd.read_csv(human_norms_path)
+            # Adapt columns: norm_name -> norm, human_rating -> cleaned_rating
+            rename_map = {'norm_name': 'norm', 'human_rating': 'cleaned_rating'}
+            df_human = df_human.rename(columns=rename_map)
+            
+            # Standardize
+            if 'word' in df_human.columns and 'norm' in df_human.columns and 'cleaned_rating' in df_human.columns:
+                 df_human['word'] = df_human['word'].astype(str).str.lower().str.strip()
+                 df_human['cleaned_rating'] = pd.to_numeric(df_human['cleaned_rating'], errors='coerce')
+                 df_human = df_human.dropna(subset=['cleaned_rating'])
+                 
+                 model_norms['human'] = df_human
+                 print(f"[Loader] Loaded Human Norms as 'human' ({len(df_human)} rows)")
+            else:
+                 print(f"[Loader] Warning: Human norms file missing required columns (Need: norm_name/norm, word, human_rating/cleaned_rating)")
+        except Exception as e:
+             print(f"[Loader] Error loading Human Norms: {e}")
+
     return model_norms
 
 def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = False, common_vocab: set = None):
@@ -229,6 +252,15 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
     cue_to_idx = mappings['cue_to_idx']
     
     emb_keys = [k for k in embeddings_dict.keys() if k != 'mappings']
+    
+    # --- FILTERING FOR SPECIFICITY ---
+    if cross_evaluate:
+        # Keep only 300d (passive/active/human) and activations
+        # Logic: k endswith '_300d' OR k.startswith('activation_')
+        pre_count = len(emb_keys)
+        emb_keys = [k for k in emb_keys if k.endswith('_300d') or k.startswith('activation_')]
+        print(f"[Judge] Filtered embeddings for Specificity: {pre_count} -> {len(emb_keys)} (Only 300d & Activations)")
+        
     print(f"[Judge] Found {len(emb_keys)} embedding sources. Processing with n_jobs={n_jobs}...")
     
     idx_to_cue = {v: k for k, v in cue_to_idx.items()}
@@ -337,6 +369,7 @@ def main():
     parser.add_argument('--embeddings_path', type=Path, required=True, help="Pickle from vectorize.py")
     parser.add_argument('--norms_dir', type=Path, required=True, help="Dir containing model norm CSVs")
     parser.add_argument('--output_dir', type=Path, required=True, help="Where to save results.csv")
+    parser.add_argument('--human_norms_path', type=Path, help="Path to human norms CSV (optional)")
     parser.add_argument('--models', nargs='*', help="List of model names to evaluate (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
     parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs")
@@ -348,7 +381,7 @@ def main():
     
     # Load Data
     embeddings, mappings = load_embeddings(args.embeddings_path)
-    model_norms = load_model_norms(args.norms_dir, allowed_models=args.models)
+    model_norms = load_model_norms(args.norms_dir, human_norms_path=args.human_norms_path, allowed_models=args.models)
     
     if not model_norms:
         print("[Judge] No model norms loaded. Exiting.")

@@ -8,16 +8,15 @@ semantic representations from Large Language Models (LLMs).
 
 Workflow Stages:
 1.  **Vectorization (Standard)**: Converts raw model outputs (logprobs/tokens) into 300d embeddings.
-2.  **Prediction (Human)**: [Optional] Evaluates embeddings against human psycholinguistic norms.
-3.  **Self-Consistency (Standard)**: Evaluates 300d embeddings against the model's own norms (Self-Prediction).
-4.  **Robustness & Specificity**:
-    - Generates High-Dimensional embeddings (matched to model activations).
-    - Runs Cross-Evaluation (All-vs-All) to determine model specificity.
-5.  **Consolidation**: Merges all results into a single master CSV.
+2.  **Self-Consistency & Specificity**:
+    - Evaluates 300d embeddings against the model's own norms (Self-Prediction).
+    - Evaluates embeddings against Human Norms (if provided).
+    - Runs specificy cross-evaluation (Model A -> Model B).
+3.  **Robustness (High-Dim)**: Included in the unified evaluation where applicable.
+4.  **Consolidation**: Merges all results into a single master CSV.
 
 Usage:
     python src/pipeline.py --n_jobs 40
-    python src/pipeline.py --run_predict_human --verbose
 """
 
 import argparse
@@ -38,7 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run the full Behavioral Representation Pipeline.")
     parser.add_argument('--models', nargs='*', help="List of models to process (substring match). If empty, runs all.")
     parser.add_argument('--skip_vectorize', action='store_true', help="Skip the vectorization step.")
-    parser.add_argument('--run_predict_human', action='store_true', help="Run the prediction (human) step (Skipped by default).")
+    # parser.add_argument('--run_predict_human', action='store_true', help="Run the prediction (human) step (Skipped by default).") # DEPRECATED
     parser.add_argument('--skip_consistency', action='store_true', help="Skip the self-consistency step.")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging.")
     parser.add_argument('--n_jobs', type=int, default=-1, help="Number of parallel jobs (default: -1 for all)")
@@ -118,35 +117,16 @@ def main():
     else:
         print("\n[Pipeline] Skipping Vectorization.")
 
-    # 2. Prediction (Human)
-    if args.run_predict_human:
-        print("\n=== STEP 2: PREDICTION (HUMAN NORMS) ===")
-        cmd = [
-            sys.executable, str(predict_script),
-            '--embeddings_path', str(embeddings_pkl),
-            '--norms_path', str(norms_path),
-            '--output_dir', str(results_dir),
-            '--n_jobs', str(args.n_jobs)
-        ]
-        if args.models:
-            cmd.extend(['--models'] + args.models)
-        if args.verbose:
-            cmd.append('--verbose')
-        run_command(cmd)
-    else:
-        print("\n[Pipeline] Skipping Prediction (Human).")
-
-    # 4. Prediction (Self-Consistency & Robustness)
-    # UNIFIED STEP: Run predict_self_consistency with --cross_evaluate
-    # 4. Prediction (Self-Consistency & Robustness)
+    # 2. Prediction (Self-Consistency & Specificity)
     # UNIFIED STEP: Run predict_self_consistency with --cross_evaluate
     # Covers:
     # 1. Self-Consistency (Model A -> Model A Norms)
     # 2. Specificity (Model A -> Model B Norms)
-    # 3. All Variants (300d, High-Dim, Contrastive)
+    # 3. Human Norms (Model A -> Human)
+    # 4. All Variants (300d, High-Dim, Contrastive)
     
     if not args.skip_consistency:
-        print("\n=== STEP 3: SELF-CONSISTENCY & SPECIFICITY (UNIFIED) ===")
+        print("\n=== STEP 2: SELF-CONSISTENCY & SPECIFICITY (UNIFIED) ===")
         consistency_script = script_dir / "evaluation" / "predict_self_consistency.py"
         model_norms_dir = project_root / 'outputs' / 'raw_behavior' / 'model_norms'
         
@@ -157,6 +137,7 @@ def main():
             sys.executable, str(consistency_script),
             '--embeddings_path', str(embeddings_pkl),
             '--norms_dir', str(model_norms_dir),
+            '--human_norms_path', str(norms_path),
             '--output_dir', str(results_dir),
             '--n_jobs', str(args.n_jobs),
             '--cross_evaluate' 
@@ -174,8 +155,8 @@ def main():
     else:
         print("\n[Pipeline] Skipping Prediction (Self-Consistency).")
 
-    # 4. Partitioning (Banded Ridge)
-    print("\n=== STEP 4: PARTITIONING (BANDED RIDGE) ===")
+    # 3. Partitioning (Banded Ridge)
+    print("\n=== STEP 3: PARTITIONING (BANDED RIDGE) ===")
     ridge_script = script_dir / "evaluation" / "predict_banded_ridge.py"
     
     cmd_ridge = [
@@ -194,8 +175,8 @@ def main():
         
     run_command(cmd_ridge)
 
-    # 5. Consolidation (Simplified - just checking the main file)
-    print("\n=== STEP 5: SUMMARY ===")
+    # 4. Consolidation
+    print("\n=== STEP 4: SUMMARY ===")
     
     merged_results = []
     
