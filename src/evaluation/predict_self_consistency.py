@@ -34,7 +34,7 @@ def load_embeddings(pkl_path: Path):
         data = pickle.load(f)
     return data['embeddings'], data['mappings']
 
-def load_model_norms(norms_dir: Path, human_norms_path: Path = None, allowed_models: list = None) -> dict:
+def load_model_norms(norms_dir: Path, human_norms_path: Path = None, allowed_models: list = None, restrict_human_to_model_norms: bool = True) -> dict:
     """
     Load all model norm CSVs from the directory.
     Returns: dict { 'model_name': pd.DataFrame }
@@ -93,6 +93,23 @@ def load_model_norms(norms_dir: Path, human_norms_path: Path = None, allowed_mod
                  
                  model_norms['human'] = df_human
                  print(f"[Loader] Loaded Human Norms as 'human' ({len(df_human)} rows)")
+                 
+                 # --- RESTRICTION LOGIC ---
+                 if restrict_human_to_model_norms:
+                     # 1. Collect all unique norms from loaded models
+                     valid_model_norms = set()
+                     for k, v in model_norms.items():
+                         if k == 'human': continue
+                         valid_model_norms.update(v['norm'].unique())
+                     
+                     if valid_model_norms:
+                         # 2. Filter human df
+                         before_len = len(model_norms['human'])
+                         model_norms['human'] = model_norms['human'][model_norms['human']['norm'].isin(valid_model_norms)]
+                         after_len = len(model_norms['human'])
+                         print(f"[Loader] Restricted Human Norms to {len(valid_model_norms)} model-present norms. ({before_len} -> {after_len} rows)")
+                     else:
+                         print("[Loader] Warning: Restriction requested but no model norms found to intersect with.")
             else:
                  print(f"[Loader] Warning: Human norms file missing required columns (Need: norm_name/norm, word, human_rating/cleaned_rating)")
         except Exception as e:
@@ -430,13 +447,17 @@ def main():
     parser.add_argument('--n_jobs', type=int, default=-2, help="Number of parallel jobs (default -2)")
     parser.add_argument('--cross_evaluate', action='store_true', help="Evaluates EVERY embedding against EVERY model norm (Specificity)")
     parser.add_argument('--test_limit', type=int, default=0, help="Test Mode: Limit norms per model")
+    # Default is RESTRICTED (True). Flag --use_full_human_norms DISABLES restriction (False).
+    parser.add_argument('--use_full_human_norms', action='store_true', help="If set, do NOT restrict human norms to those present in models.")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load Data
     embeddings, mappings = load_embeddings(args.embeddings_path)
-    model_norms = load_model_norms(args.norms_dir, human_norms_path=args.human_norms_path, allowed_models=args.models)
+    # Default restrict=True unless flag is present
+    restrict_human = not args.use_full_human_norms
+    model_norms = load_model_norms(args.norms_dir, human_norms_path=args.human_norms_path, allowed_models=args.models, restrict_human_to_model_norms=restrict_human)
     
     if not model_norms:
         print("[Judge] No model norms loaded. Exiting.")
