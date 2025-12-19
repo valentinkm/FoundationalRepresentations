@@ -199,8 +199,31 @@ def main():
         
         # Summary for Ridge
         print(f"\n[Summary] Loaded {len(df_ridge)} results from {ridge_res_path.name}")
-        print("\n--- Banded Ridge Leaderboard ---")
-        print(df_ridge.groupby('model')['r2_joint'].mean().sort_values(ascending=False))
+        print("\n--- Banded Ridge Leaderboard (R2 Joint) ---")
+        if 'r2_full_mean' in df_ridge.columns:
+             # N-Band Result
+             print(df_ridge.groupby('model')['r2_full_mean'].mean().sort_values(ascending=False))
+             
+             for band in ['Activation', 'Passive', 'Active']:
+                 col = f'delta_{band}_mean'
+                 if col in df_ridge.columns:
+                     print(f"\n--- Unique {band} Contribution (Full - Reduced) ---")
+                     print(df_ridge.groupby('model')[col].mean().sort_values(ascending=False))
+                     
+        elif 'r2_joint_mean' in df_ridge.columns:
+            # 2-Band Legacy
+            print(df_ridge.groupby('model')['r2_joint_mean'].mean().sort_values(ascending=False))
+            
+            print("\n--- Unique Activation Contribution (Joint - Behavior) ---")
+            print("Higher = Activation adds more unique value")
+            print(df_ridge.groupby('model')['delta_B_mean'].mean().sort_values(ascending=False))
+
+            print("\n--- Unique Behavior Contribution (Joint - Activation) ---")
+            print("Higher = Behavior adds more unique value")
+            print(df_ridge.groupby('model')['delta_A_mean'].mean().sort_values(ascending=False))
+        else:
+             # Fallback for legacy
+             print(df_ridge.groupby('model')['r2_joint'].mean().sort_values(ascending=False))
         
     # Standard Leaderboard
     if std_res_path.exists():
