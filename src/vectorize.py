@@ -412,7 +412,7 @@ def calculate_ppmi(matrix: csr_matrix, smooth: float = 1e-10) -> csr_matrix:
     
     return csr_matrix((ppmi_values, (rows, cols)), shape=matrix.shape)
 
-def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, verbose: bool):
+def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, verbose: bool, skip_high_dim: bool = False):
     """Helper for parallel PPMI+SVD with Multi-Dim Output."""
     if key == 'mappings': return None
     
@@ -428,7 +428,7 @@ def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, 
     configs.append((300, "_300d"))
     
     # 2. High Dim (if activation dim found)
-    if clean_name in activation_dims:
+    if not skip_high_dim and clean_name in activation_dims:
         target_d = activation_dims[clean_name]
         if target_d != 300: # Avoid duplicate if by chance it's 300
              configs.append((target_d, f"_{target_d}d"))
@@ -497,14 +497,14 @@ def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, 
              
     return sanitized
 
-def derive_dense_embeddings(matrices: dict, activation_dims: dict, verbose: bool = False, n_jobs: int = 1) -> dict:
+def derive_dense_embeddings(matrices: dict, activation_dims: dict, verbose: bool = False, n_jobs: int = 1, skip_high_dim: bool = False) -> dict:
     """
     Convert Sparse Count/Prob Matrices -> PPMI -> SVD Dense Vectors (Multi-Dim).
     """
     print(f"[Transformation] Applying PPMI + SVD (All Variants) with n_jobs={n_jobs}...")
     
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_single_transform)(key, mat, activation_dims, verbose)
+        delayed(_process_single_transform)(key, mat, activation_dims, verbose, skip_high_dim)
         for key, mat in matrices.items()
         if key != 'mappings'
     )
@@ -532,6 +532,7 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True, help="Dir to save output pickle")
     parser.add_argument('--models', nargs='*', help="List of model names to process (substring match)")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
+    parser.add_argument('--skip_high_dim', action='store_true', help="Skip generation of high-dimensional behavioral embeddings (matching activation dims)")
     parser.add_argument('--n_jobs', type=int, default=1, help="Number of parallel jobs (-1 for all)")
     args = parser.parse_args()
 
@@ -687,7 +688,7 @@ def main():
         print(f"[Dims] Known activation dims: {list(activation_dims.keys())}")
 
     # 4. Transform (PPMI -> SVD (300d + HighDim))
-    dense_results = derive_dense_embeddings(matrices, activation_dims=activation_dims, verbose=args.verbose, n_jobs=args.n_jobs)
+    dense_results = derive_dense_embeddings(matrices, activation_dims=activation_dims, verbose=args.verbose, n_jobs=args.n_jobs, skip_high_dim=args.skip_high_dim)
     
     # 5. Export
     # Merge dense results with raw activation matrices AND Existing

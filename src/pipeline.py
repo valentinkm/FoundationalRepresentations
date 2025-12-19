@@ -39,6 +39,7 @@ def main():
     parser.add_argument('--skip_vectorize', action='store_true', help="Skip the vectorization step.")
     # parser.add_argument('--run_predict_human', action='store_true', help="Run the prediction (human) step (Skipped by default).") # DEPRECATED
     parser.add_argument('--skip_consistency', action='store_true', help="Skip the self-consistency step.")
+    parser.add_argument('--skip_high_dim', action='store_true', help="Skip high-dimensional behavioral embeddings in vectorization.")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging.")
     parser.add_argument('--n_jobs', type=int, default=-1, help="Number of parallel jobs (default: -1 for all)")
     parser.add_argument('--test_mode', action='store_true', help="Run a fast smoke test (1 model, 5 norms)")
@@ -106,6 +107,8 @@ def main():
             cmd.extend(['--models'] + args.models)
         if args.verbose:
             cmd.append('--verbose')
+        if args.skip_high_dim:
+            cmd.append('--skip_high_dim')
             
         # Add Deranged Dir if it exists
         if deranged_dir.exists():
