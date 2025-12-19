@@ -43,8 +43,9 @@ def main():
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging.")
 
     parser.add_argument('--n_jobs', type=int, default=-1, help="Number of parallel jobs (default: -1 for all)")
+
     parser.add_argument('--test_mode', action='store_true', help="Run a fast smoke test (1 model, 5 norms)")
-    parser.add_argument('--export_predictions', action='store_true', help="Export per-cue predictions during evaluation")
+    parser.add_argument('--skip_export_predictions', action='store_true', help="Skip exporting per-cue predictions (Default: Export is Enabled)")
     args = parser.parse_args()
 
     # Define paths
@@ -146,14 +147,16 @@ def main():
             '--output_dir', str(results_dir),
 
             '--n_jobs', str(args.n_jobs),
+
             '--cross_evaluate' 
         ]
         
-        if args.export_predictions:
-            cmd.append('--export_predictions')
-            # Assuming default path for pipeline
-            predictions_path = results_dir / "cue_predictions.parquet"
-            cmd.extend(['--predictions_path', str(predictions_path)])
+        if args.skip_export_predictions:
+            cmd.append('--skip_export_predictions')
+        else:
+             # Default is to export to standard path
+             predictions_path = results_dir / "cue_predictions.parquet"
+             cmd.extend(['--predictions_path', str(predictions_path)])
         if args.models:
             cmd.extend(['--models'] + args.models)
         if args.verbose:

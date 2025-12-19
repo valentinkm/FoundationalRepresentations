@@ -508,15 +508,16 @@ def main():
     parser.add_argument('--n_jobs', type=int, default=-2, help="Number of parallel jobs (default -2)")
     parser.add_argument('--cross_evaluate', action='store_true', help="Evaluates EVERY embedding against EVERY model norm (Specificity)")
 
+
     parser.add_argument('--test_limit', type=int, default=0, help="Test Mode: Limit norms per model")
     # Default is RESTRICTED (True). Flag --use_full_human_norms DISABLES restriction (False).
     parser.add_argument('--use_full_human_norms', action='store_true', help="If set, do NOT restrict human norms to those present in models.")
-    parser.add_argument('--export_predictions', action='store_true', help="Export per-cue predictions to parquet.")
+    parser.add_argument('--skip_export_predictions', action='store_true', help="Skip exporting per-cue predictions to parquet.")
     parser.add_argument('--predictions_path', type=Path, default=Path("outputs/results/cue_predictions.parquet"), help="Path to save predictions parquet.")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    if args.export_predictions:
+    if not args.skip_export_predictions:
         args.predictions_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Load Data
@@ -531,7 +532,7 @@ def main():
 
     # Run Eval
     output_csv = args.output_dir / "self_consistency_results.csv"
-    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs, cross_evaluate=args.cross_evaluate, test_limit=args.test_limit, export_predictions=args.export_predictions, predictions_path=args.predictions_path)
+    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs, cross_evaluate=args.cross_evaluate, test_limit=args.test_limit, export_predictions=(not args.skip_export_predictions), predictions_path=args.predictions_path)
 
 if __name__ == "__main__":
     import sys
