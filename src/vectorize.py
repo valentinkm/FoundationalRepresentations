@@ -414,7 +414,7 @@ def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, 
             S_slice = Sigma[:eff_d]
             emb = U_slice * np.sqrt(S_slice)
             
-            # Pad if rank deficient or if max_k was lower than d (unlikely given max_k logic, but safe to have)
+            # Pad if rank deficient
             if emb.shape[1] < d:
                 padding = d - emb.shape[1]
                 emb = np.pad(emb, ((0,0), (0, padding)), mode='constant')
@@ -422,7 +422,7 @@ def _process_single_transform(key: str, mat: csr_matrix, activation_dims: dict, 
             results.append((f"{key}{suffix}", emb))
             
     except Exception as e:
-        print(f"    SVD Failed ({e}). Using randomized SVD fallback.")
+        print(f"    [Warning] SVD Failed ({e}). Using randomized SVD fallback.")
         U, Sigma, VT = randomized_svd(ppmi, n_components=actual_k, random_state=42)
         
         for d, suffix in configs:
@@ -515,23 +515,14 @@ def main():
         real_keys = set(k for k in matrices.keys() if k.startswith("passive_") and not "contrastive" in k)
         
         for r_key in real_keys:
-            # r_key: 'passive_modelname'
-            # d_key should be: 'passive_modelname' (since loading function names it so) 
-            # BUT process_passive_logprobs returns 'passive_{stem}'. 
-            # We need to match stems.
-            
-            # The deranged files likely have different filenames (e.g. model-deranged.csv)
-            # So process_passive_logprobs will return 'passive_model-deranged'
-            
-            # Heuristic: We need to match 'passive_model' with 'passive_model-deranged' (or similar).
-            # Let's rely on the model name being a substring.
+            # Match 'passive_{model}' with 'passive_{model}-deranged'
+            # Note: Deranged files typically have the stem 'model-deranged'
             
             model_stem = r_key.replace("passive_", "")
             
             # Find matching deranged key
             d_key = None
             for candidate in deranged_mats.keys():
-                # Expected: candidate = 'passive_{model}-deranged'
                 if model_stem in candidate:
                     d_key = candidate
                     break
