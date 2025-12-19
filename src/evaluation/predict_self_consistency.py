@@ -210,7 +210,10 @@ def align_data(embedding_mat, cue_to_idx, norm_df, norm_name, verbose: bool = Fa
 
     return X, y, overlap
 
-def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
+
+from sklearn.model_selection import cross_val_score, KFold, cross_val_predict
+
+def evaluate_embedding(X, y, overlap_words, random_state=42, verbose: bool = False, export_predictions: bool = False):
     """Run Ridge Regression with Nested CV."""
     # Sanitize X
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -222,18 +225,31 @@ def evaluate_embedding(X, y, random_state=42, verbose: bool = False):
     
     cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=random_state)
     try:
+        # 1. Scores
         scores = cross_val_score(model, X, y, cv=cv, scoring='r2')
-        if verbose:
-            model.fit(X, y)
-            best_alpha = model.named_steps['ridgecv'].alpha_
-            print(f"    > Best Alpha: {best_alpha}")
-        return scores.mean(), scores.std()
+        mean_r2, std_r2 = scores.mean(), scores.std()
+        
+        preds_df = None
+        if export_predictions:
+            # 2. Predictions
+            y_pred = cross_val_predict(model, X, y, cv=cv)
+            # Create DataFrame
+            preds_df = pd.DataFrame({
+                'word': overlap_words,
+                'y_true': y,
+                'y_pred': y_pred,
+                'residual': y_pred - y,
+                'abs_residual': np.abs(y_pred - y)
+            })
+            
+        return mean_r2, std_r2, preds_df
+        
     except Exception as e:
         if verbose:
             print(f"    [Error] Regression failed: {e}")
-        return np.nan, np.nan
+        return np.nan, np.nan, None
 
-def process_single_norm_evaluation(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab=None):
+def process_single_norm_evaluation(emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab=None, export_predictions=False):
     """Helper to evaluate a single norm for a given embedding matrix."""
     X, y, overlap = align_data(X_full, cue_to_idx, norms_df, norm, verbose=verbose, common_vocab=common_vocab)
     
@@ -242,10 +258,16 @@ def process_single_norm_evaluation(emb_name, matched_model, X_full, cue_to_idx, 
             print(f"    > Skipped (Insufficient Overlap)")
         return None
         
-    mean_r2, std_r2 = evaluate_embedding(X, y, verbose=verbose)
+    mean_r2, std_r2, preds_df = evaluate_embedding(X, y, overlap, verbose=verbose, export_predictions=export_predictions)
     
     if np.isnan(mean_r2):
         return None
+        
+    # Enrich predictions if present
+    if preds_df is not None:
+        preds_df['embedding_source'] = emb_name
+        preds_df['target_model'] = matched_model
+        preds_df['norm_name'] = norm
         
     return {
         'embedding_source': emb_name,
@@ -253,10 +275,12 @@ def process_single_norm_evaluation(emb_name, matched_model, X_full, cue_to_idx, 
         'norm_name': norm,
         'r2_mean': mean_r2,
         'r2_std': std_r2,
-        'n_samples': len(overlap)
+        'n_samples': len(overlap),
+        'predictions': preds_df
     }
 
-def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path, verbose: bool = False, n_jobs: int = 1, cross_evaluate: bool = False, test_limit: int = 0):
+def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path, verbose: bool = False, n_jobs: int = 1, cross_evaluate: bool = False, test_limit: int = 0, export_predictions: bool = False, predictions_path: Path = None):
+
     """
     Main loop.
     Logic:
@@ -404,10 +428,11 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
         if verbose:
              print(f"\n[Judge] Evaluating {emb_name} -> {matched_model} norms ({len(norms)} norms)...")
 
+
         # Parallelize norms for this embedding-model pair
         results_for_pair = Parallel(n_jobs=n_jobs)(
             delayed(process_single_norm_evaluation)(
-                emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab
+                emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab, export_predictions
             )
             for norm in norms
         )
@@ -417,8 +442,40 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
                 results.append(res)
             pbar.update(1)    
             
-    # Save (Merge)
+    # Save (Merge) Scores
     new_res_df = pd.DataFrame(results)
+    
+    # Extract Prediction Dataframes
+    if export_predictions and predictions_path:
+        print(f"\n[Judge] Aggregating Predictions to {predictions_path}...")
+        all_preds = []
+        for res in results:
+            if res and 'predictions' in res and res['predictions'] is not None:
+                all_preds.append(res['predictions'])
+        
+        if all_preds:
+            full_preds_df = pd.concat(all_preds, ignore_index=True)
+            # Append if file exists?
+            try:
+                # If file exists, we could load and append. Or just overwrite for this run?
+                # User usually runs full pipeline. Append is safer for restart.
+                import os
+                if predictions_path.exists():
+                     # Check if Parquet
+                     # Appending to Parquet without reading is tricky. 
+                     # Simplest: Read existing, concat, drop duplicates, save.
+                     existing_preds = pd.read_parquet(predictions_path)
+                     full_preds_df = pd.concat([existing_preds, full_preds_df], ignore_index=True)
+                     full_preds_df = full_preds_df.drop_duplicates(subset=['embedding_source', 'target_model', 'norm_name', 'word'])
+                
+                full_preds_df.to_parquet(predictions_path)
+                print(f"[Judge] Saved {len(full_preds_df)} prediction rows.")
+            except Exception as e:
+                print(f"[Judge] Error saving predictions: {e}")
+                
+    # Cleanup 'predictions' column from results before saving CSV
+    if 'predictions' in new_res_df.columns:
+        new_res_df = new_res_df.drop(columns=['predictions'])
     
     if not new_res_df.empty:
         if not existing_df.empty:
@@ -450,12 +507,17 @@ def main():
     parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
     parser.add_argument('--n_jobs', type=int, default=-2, help="Number of parallel jobs (default -2)")
     parser.add_argument('--cross_evaluate', action='store_true', help="Evaluates EVERY embedding against EVERY model norm (Specificity)")
+
     parser.add_argument('--test_limit', type=int, default=0, help="Test Mode: Limit norms per model")
     # Default is RESTRICTED (True). Flag --use_full_human_norms DISABLES restriction (False).
     parser.add_argument('--use_full_human_norms', action='store_true', help="If set, do NOT restrict human norms to those present in models.")
+    parser.add_argument('--export_predictions', action='store_true', help="Export per-cue predictions to parquet.")
+    parser.add_argument('--predictions_path', type=Path, default=Path("outputs/results/cue_predictions.parquet"), help="Path to save predictions parquet.")
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.export_predictions:
+        args.predictions_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Load Data
     embeddings, mappings = load_embeddings(args.embeddings_path)
@@ -469,7 +531,7 @@ def main():
 
     # Run Eval
     output_csv = args.output_dir / "self_consistency_results.csv"
-    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs, cross_evaluate=args.cross_evaluate, test_limit=args.test_limit)
+    run_evaluation_loop(embeddings, mappings, model_norms, output_csv, verbose=args.verbose, n_jobs=args.n_jobs, cross_evaluate=args.cross_evaluate, test_limit=args.test_limit, export_predictions=args.export_predictions, predictions_path=args.predictions_path)
 
 if __name__ == "__main__":
     import sys
