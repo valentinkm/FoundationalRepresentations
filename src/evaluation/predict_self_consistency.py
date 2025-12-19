@@ -283,23 +283,31 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
         print(f"[Judge] CRITICAL: Common vocabulary is too small ({len(common_vocab)}). Aborting.")
         return
 
+    
+    # --- CHECK EXISTING RESULTS ---
+    existing_df = pd.DataFrame()
+    completed_keys = set()
+    
+    if output_path.exists():
+        try:
+            existing_df = pd.read_csv(output_path)
+            # Ensure columns exist
+            req_cols = ['embedding_source', 'target_model', 'norm_name']
+            if all(c in existing_df.columns for c in req_cols):
+                print(f"[Judge] Found existing results at {output_path} ({len(existing_df)} rows).")
+                for _, row in existing_df.iterrows():
+                    completed_keys.add((row['embedding_source'], row['target_model'], row['norm_name']))
+                print(f"[Judge] Skipping {len(completed_keys)} already computed pairs.")
+            else:
+                print(f"[Judge] Existing file {output_path} has wrong format. Overwriting/Appending safely.")
+        except Exception as e:
+            print(f"[Judge] Error reading existing results: {e}. Starting fresh.")
+    
     # Progress bar logic
     # Calculate total steps by summing the number of norms for each matched model
     total_steps = 0
-    for emb_name in emb_keys:
-        matched_model = None
-        for model_key in model_norms_dict.keys():
-            if model_key in emb_name:
-                matched_model = model_key
-                break
-        if matched_model or cross_evaluate:
-            if cross_evaluate:
-                total_steps += sum([len(df['norm'].unique()) for df in model_norms_dict.values()])
-            else:
-                norms_df = model_norms_dict[matched_model]
-                total_steps += len(norms_df['norm'].unique())
-            
-    pbar = tqdm(total=total_steps, desc="Evaluating")
+    # Store work items to avoid re-looping complex logic
+    work_items = []
     
     for emb_name in emb_keys:
         # Determine Target Models
@@ -332,7 +340,8 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
         
         if not target_models:
             if verbose:
-                print(f"[Judge] Skipping {emb_name}: No matching norms found (and distinct cross-eval not requested).")
+                # print(f"[Judge] Skipping {emb_name}: No matching norms found.")
+                pass
             continue
             
         for matched_model in target_models:
@@ -341,37 +350,74 @@ def run_evaluation_loop(embeddings_dict, mappings, model_norms_dict, output_path
             
             if test_limit and test_limit > 0:
                 all_norms = all_norms[:test_limit]
-                if verbose:
-                    print(f"    [Test Mode] Limiting to first {len(all_norms)} norms.")
-            
-            if verbose:
-                print(f"\n[Judge] Evaluating {emb_name} -> {matched_model} norms ({len(all_norms)} norms)...")
                 
-            X_full = embeddings_dict[emb_name]
+            # Filter Skip Keys
+            norms_to_run = []
+            for norm in all_norms:
+                if (emb_name, matched_model, norm) not in completed_keys:
+                    norms_to_run.append(norm)
             
-            # Parallelize norms for this embedding-model pair
-            results_for_pair = Parallel(n_jobs=n_jobs)(
-                delayed(process_single_norm_evaluation)(
-                    emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab
-                )
-                for norm in all_norms
-            )
+            if norms_to_run:
+                work_items.append({
+                    'emb_name': emb_name,
+                    'matched_model': matched_model,
+                    'norms': norms_to_run,
+                    'X_full': embeddings_dict[emb_name],
+                    'norms_df': norms_df
+                })
+                total_steps += len(norms_to_run)
             
-            for res in results_for_pair:
-                if res:
-                    results.append(res)
-                pbar.update(1)    
-    # Save
-    res_df = pd.DataFrame(results)
-    res_df.to_csv(output_path, index=False)
-    print(f"\n[Judge] Self-Consistency Evaluation complete. Results saved to {output_path}")
+    if total_steps == 0:
+        print("[Judge] All tasks already completed. Nothing to run.")
+        return
+
+    pbar = tqdm(total=total_steps, desc="Evaluating")
     
-    if not res_df.empty:
+    for item in work_items:
+        emb_name = item['emb_name']
+        matched_model = item['matched_model']
+        norms = item['norms']
+        X_full = item['X_full']
+        norms_df = item['norms_df']
+        
+        if verbose:
+             print(f"\n[Judge] Evaluating {emb_name} -> {matched_model} norms ({len(norms)} norms)...")
+
+        # Parallelize norms for this embedding-model pair
+        results_for_pair = Parallel(n_jobs=n_jobs)(
+            delayed(process_single_norm_evaluation)(
+                emb_name, matched_model, X_full, cue_to_idx, norms_df, norm, verbose, common_vocab
+            )
+            for norm in norms
+        )
+        
+        for res in results_for_pair:
+            if res:
+                results.append(res)
+            pbar.update(1)    
+            
+    # Save (Merge)
+    new_res_df = pd.DataFrame(results)
+    
+    if not new_res_df.empty:
+        if not existing_df.empty:
+            final_df = pd.concat([existing_df, new_res_df], ignore_index=True)
+            print(f"[Judge] Merged {len(new_res_df)} new results with {len(existing_df)} existing results.")
+        else:
+            final_df = new_res_df
+            
+        # Deduplicate just in case
+        final_df = final_df.drop_duplicates(subset=['embedding_source', 'target_model', 'norm_name'])
+        
+        final_df.to_csv(output_path, index=False)
+        print(f"\n[Judge] Self-Consistency Evaluation complete. Results saved to {output_path}")
+        
         print("\n--- Leaderboard (Average R^2 across all norms) ---")
-        summary = res_df.groupby('embedding_source')['r2_mean'].mean().sort_values(ascending=False)
+        summary = final_df.groupby('embedding_source')['r2_mean'].mean().sort_values(ascending=False)
         print(summary)
     else:
-        print("\n[Judge] Warning: No valid results produced.")
+        print("\n[Judge] No new valid results produced.")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Self-Consistency (Model Embeddings vs Model Norms).")
